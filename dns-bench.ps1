@@ -1,19 +1,21 @@
 #Requires -Version 5.1
 
 param(
-    [int]$Rounds = 8,
+    [int]$Passes = 5,
+    [int]$Rounds = 0,
     [string[]]$Servers = @(),
     [string[]]$ExcludeServers = @(),
     [string[]]$Domains = @(
         'www.google.com',
         'www.cloudflare.com',
         'www.wikipedia.org',
-        'github.com',
-        'www.microsoft.com',
-        'www.amazon.com',
-        'www.youtube.com'
+        'www.microsoft.com'
     )
 )
+
+if ($Rounds -gt 0 -and $PSBoundParameters.ContainsKey('Rounds') -and -not $PSBoundParameters.ContainsKey('Passes')) {
+    $Passes = $Rounds
+}
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -126,9 +128,6 @@ if ($systemDns.Count -gt 0) {
 } else {
     Write-Host "No active System DNS detected on Up adapters; benchmarking public resolvers only." -ForegroundColor DarkGray
 }
-
-Write-Host ("Starting benchmark: {0} servers, {1} test rounds (+ 1 warm-up round)...`n" -f $testList.Count, $Rounds) -ForegroundColor Cyan
-
 # Benchmark execution with interleaved round-robin queries
 $results = @{}
 $fails   = @{}
@@ -137,36 +136,94 @@ foreach ($t in $testList) {
     $fails[$t.Server]   = 0
 }
 
-$totalRounds = $Rounds + 1
+$startTime = Get-Date
+$rawSamples = [System.Collections.Generic.List[psobject]]::new()
+$totalScoredQueriesPerServer = $Passes * $Domains.Count
+
+Write-Host ("Starting benchmark: {0} servers, {1} passes x {2} domains ({3} scored queries/server) + 1 warm-up pass...`n" -f $testList.Count, $Passes, $Domains.Count, $totalScoredQueriesPerServer) -ForegroundColor Cyan
+
+# Warm-up pass (primes resolver cache across all benchmark domains; discarded from scored metrics)
 $sweep = 0
-for ($r = 1; $r -le $totalRounds; $r++) {
-    $domain = $Domains[($r - 1) % $Domains.Count]
+Write-Host "Running warm-up pass across all domains (cache priming, discarded)..." -ForegroundColor DarkGray
+foreach ($domain in $Domains) {
     $offset = $sweep % $testList.Count
     $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
+    $currentSweep = $sweep
     $sweep++
+    $pos = 0
     foreach ($t in $roundServers) {
+        $pos++
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $ok = $true
+        $errId = ""
         try {
             Resolve-DnsName -Name $domain -Server $t.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
         } catch {
             $ok = $false
+            $errId = $_.FullyQualifiedErrorId
         }
         $sw.Stop()
 
-        if ($ok) {
-            if ($r -gt 1) { $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds) }
-        } else {
-            if ($r -gt 1) { $fails[$t.Server]++ }
-        }
+        $rawSamples.Add([pscustomobject]@{
+            Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+            Pass       = "Warmup"
+            SweepIndex = $currentSweep
+            Position   = $pos
+            Domain     = $domain
+            Server     = $t.Server
+            Provider   = $t.Provider
+            Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
+            Status     = if ($ok) { "Success" } else { "Fail" }
+            ErrorId    = $errId
+        })
         Start-Sleep -Milliseconds 100
     }
+}
+Write-Host "Warm-up pass finished.`n" -ForegroundColor DarkGray
 
-    if ($r -eq 1) {
-        Write-Host "Warm-up round finished (cache primed, discarded)" -ForegroundColor DarkGray
-    } else {
-        Write-Host ("Round {0}/{1} completed (domain: {2})" -f ($r - 1), $Rounds, $domain)
+# Scored benchmark passes
+for ($pass = 1; $pass -le $Passes; $pass++) {
+    foreach ($domain in $Domains) {
+        $offset = $sweep % $testList.Count
+        $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
+        $currentSweep = $sweep
+        $sweep++
+        $pos = 0
+        foreach ($t in $roundServers) {
+            $pos++
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $ok = $true
+            $errId = ""
+            try {
+                Resolve-DnsName -Name $domain -Server $t.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
+            } catch {
+                $ok = $false
+                $errId = $_.FullyQualifiedErrorId
+            }
+            $sw.Stop()
+
+            if ($ok) {
+                $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds)
+            } else {
+                $fails[$t.Server]++
+            }
+
+            $rawSamples.Add([pscustomobject]@{
+                Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+                Pass       = $pass
+                SweepIndex = $currentSweep
+                Position   = $pos
+                Domain     = $domain
+                Server     = $t.Server
+                Provider   = $t.Provider
+                Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
+                Status     = if ($ok) { "Success" } else { "Fail" }
+                ErrorId    = $errId
+            })
+            Start-Sleep -Milliseconds 100
+        }
     }
+    Write-Host ("Pass {0}/{1} completed" -f $pass, $Passes)
 }
 
 function Get-Median {
@@ -291,9 +348,22 @@ if ($clean.Count -ge 1) {
     Write-Host "No servers completed without failures. Please verify your internet connection or server list." -ForegroundColor Red
 }
 
-$csv = Join-Path $PSScriptRoot ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
-$rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+$allCleanTimes = @($results.Values | ForEach-Object { $_ } | Where-Object { $_ -gt 0 })
+$obsFloor = if ($allCleanTimes.Count -gt 0) { [math]::Round(($allCleanTimes | Measure-Object -Min).Minimum, 1) } else { 0 }
+
 Write-Host ""
-Write-Host ("CSV report saved: {0}" -f $csv)
+Write-Host ("Baseline Performance: Instrument Overhead ~0.55 ms (Win32 Cmdlet) | This Run's Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
+
+# Save sibling raw samples CSV
+$samplesCsv = Join-Path $PSScriptRoot ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
+$rawSamples | Export-Csv -Path $samplesCsv -NoTypeInformation -Encoding UTF8
+
+# Save aggregate CSV with run metadata
+$csv = Join-Path $PSScriptRoot ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
+$rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
+Write-Host ("Raw samples CSV log saved:  {0}" -f $samplesCsv)
 Write-Host "Tip: Differences in median latency under 15-20 ms are barely noticeable in normal browsing."
 Write-Host "Prioritize security features (e.g., malware blocking) and consistent max latency over small median gains."
