@@ -157,14 +157,18 @@ foreach ($t in $testList) {
 
 $startTime = Get-Date
 $rawSamples = [System.Collections.Generic.List[psobject]]::new()
-$totalScoredQueriesPerServer = $Passes * $Domains.Count
+$totalWarmupQueries = $Domains.Count * $testList.Count
+$totalScoredQueries = $Passes * $Domains.Count * $testList.Count
+$totalQueries = $totalWarmupQueries + $totalScoredQueries
+$queryIdx = 0
 
-Write-Host ("Starting benchmark: {0} servers, {1} passes x {2} domains ({3} scored queries/server) + 1 warm-up pass...`n" -f $testList.Count, $Passes, $Domains.Count, $totalScoredQueriesPerServer) -ForegroundColor Cyan
+Write-Host ("Starting benchmark: {0} servers, {1} passes x {2} domains ({3} scored queries/server) + 1 warm-up pass...`n" -f $testList.Count, $Passes, $Domains.Count, ($Passes * $Domains.Count)) -ForegroundColor Cyan
 
 # Warm-up pass (primes resolver cache across all benchmark domains; discarded from scored metrics)
 $sweep = 0
 Write-Host "Running warm-up pass across all domains (cache priming, discarded)..." -ForegroundColor DarkGray
 foreach ($domain in $Domains) {
+    Write-Host ("  [Warm-up] Priming cache for {0} across {1} servers..." -f $domain, $testList.Count) -ForegroundColor DarkGray
     $offset = $sweep % $testList.Count
     $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
     $currentSweep = $sweep
@@ -172,6 +176,13 @@ foreach ($domain in $Domains) {
     $pos = 0
     foreach ($t in $roundServers) {
         $pos++
+        $queryIdx++
+        $pct = [math]::Min(100, [math]::Round(($queryIdx / $totalQueries) * 100))
+        Write-Progress -Activity "DNS Benchmark" `
+            -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
+            -CurrentOperation ("Testing {0} ({1})..." -f $t.Provider, $t.Server) `
+            -PercentComplete $pct
+
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $ok = $true
         $errId = ""
@@ -182,6 +193,11 @@ foreach ($domain in $Domains) {
             $errId = $_.FullyQualifiedErrorId
         }
         $sw.Stop()
+
+        Write-Progress -Activity "DNS Benchmark" `
+            -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
+            -CurrentOperation ("Testing {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
+            -PercentComplete $pct
 
         $rawSamples.Add([pscustomobject]@{
             Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -202,7 +218,9 @@ Write-Host "Warm-up pass finished.`n" -ForegroundColor DarkGray
 
 # Scored benchmark passes
 for ($pass = 1; $pass -le $Passes; $pass++) {
+    $passStartTime = Get-Date
     foreach ($domain in $Domains) {
+        Write-Host ("  [Pass {0}/{1}] Testing domain: {2}..." -f $pass, $Passes, $domain) -ForegroundColor DarkGray
         $offset = $sweep % $testList.Count
         $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
         $currentSweep = $sweep
@@ -210,6 +228,13 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
         $pos = 0
         foreach ($t in $roundServers) {
             $pos++
+            $queryIdx++
+            $pct = [math]::Min(100, [math]::Round(($queryIdx / $totalQueries) * 100))
+            Write-Progress -Activity "DNS Benchmark" `
+                -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
+                -CurrentOperation ("Querying {0} ({1})..." -f $t.Provider, $t.Server) `
+                -PercentComplete $pct
+
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $ok = $true
             $errId = ""
@@ -220,6 +245,11 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
                 $errId = $_.FullyQualifiedErrorId
             }
             $sw.Stop()
+
+            Write-Progress -Activity "DNS Benchmark" `
+                -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
+                -CurrentOperation ("Querying {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
+                -PercentComplete $pct
 
             if ($ok) {
                 $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds)
@@ -242,8 +272,12 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
             Start-Sleep -Milliseconds 100
         }
     }
-    Write-Host ("Pass {0}/{1} completed" -f $pass, $Passes)
+    $passElapsed = (Get-Date) - $passStartTime
+    $totalElapsed = (Get-Date) - $startTime
+    Write-Host ("Pass {0}/{1} completed ({2}/{3} scored queries) | Pass time: {4:mm\:ss} | Total: {5:mm\:ss}" -f $pass, $Passes, ($pass * $Domains.Count * $testList.Count), $totalScoredQueries, $passElapsed, $totalElapsed) -ForegroundColor Green
 }
+
+Write-Progress -Activity "DNS Benchmark" -Completed
 
 function Get-Median {
     param([double[]]$Values)
