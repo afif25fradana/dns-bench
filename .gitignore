@@ -1,2 +1,2 @@
-# Run report logs
-dns-bench-*.csv
+# Ignore temporary test run logs in root folder
+/dns-bench-*.csv
