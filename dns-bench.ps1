@@ -138,9 +138,13 @@ foreach ($t in $testList) {
 }
 
 $totalRounds = $Rounds + 1
+$sweep = 0
 for ($r = 1; $r -le $totalRounds; $r++) {
     $domain = $Domains[($r - 1) % $Domains.Count]
-    foreach ($t in $testList) {
+    $offset = $sweep % $testList.Count
+    $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
+    $sweep++
+    foreach ($t in $roundServers) {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $ok = $true
         try {
@@ -153,8 +157,9 @@ for ($r = 1; $r -le $totalRounds; $r++) {
         if ($ok) {
             if ($r -gt 1) { $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds) }
         } else {
-            $fails[$t.Server]++
+            if ($r -gt 1) { $fails[$t.Server]++ }
         }
+        Start-Sleep -Milliseconds 100
     }
 
     if ($r -eq 1) {
