@@ -1,6 +1,7 @@
 #Requires -Version 5.1
 
 param(
+    [ValidateRange(1, [int]::MaxValue)]
     [int]$Passes = 5,
     [int]$Rounds = 0,
     [string[]]$Servers = @(),
@@ -38,18 +39,31 @@ foreach ($fam in $families.Keys) {
     }
 }
 
+# Normalize Domains parameter inputs (supports comma-separated strings)
+$flatDomains = @()
+foreach ($d in $Domains) {
+    if ($d) {
+        ($d -split ',') | ForEach-Object {
+            $cleaned = $_.Trim(" `"'")
+            if ($cleaned) { $flatDomains += $cleaned }
+        }
+    }
+}
+if ($flatDomains.Count -gt 0) { $Domains = $flatDomains }
+
 # Pre-flight internet connectivity check
-Write-Host "Checking internet connectivity..." -ForegroundColor Cyan
+$preflightDomain = if ($Domains.Count -gt 0) { $Domains[0] } else { 'www.google.com' }
+Write-Host ("Checking internet connectivity ({0})..." -f $preflightDomain) -ForegroundColor Cyan
 $online = $false
 try {
-    $test = Resolve-DnsName -Name 'www.google.com' -Type A -DnsOnly -ErrorAction Stop
+    $test = Resolve-DnsName -Name $preflightDomain -Type A -DnsOnly -NoHostsFile -ErrorAction Stop
     if ($test) { $online = $true }
 } catch {
     $online = $false
 }
 
 if (-not $online) {
-    Write-Warning "Could not resolve test domain. Please verify your internet connection."
+    Write-Warning ("Could not resolve test domain '{0}'. Please verify your internet connection." -f $preflightDomain)
     return
 }
 
@@ -127,6 +141,11 @@ if ($systemDns.Count -gt 0) {
     Write-Host ("Detected active System DNS (Up adapters): {0}" -f $sysSummary) -ForegroundColor DarkGray
 } else {
     Write-Host "No active System DNS detected on Up adapters; benchmarking public resolvers only." -ForegroundColor DarkGray
+}
+
+if ($testList.Count -eq 0) {
+    Write-Warning "No valid DNS servers available to benchmark. Please verify your -Servers and -ExcludeServers parameters."
+    return
 }
 # Benchmark execution with interleaved round-robin queries
 $results = @{}
@@ -337,7 +356,7 @@ if ($clean.Count -ge 1) {
         $secondary = if ($clean.Count -ge 2) { $clean[1] } else { $null }
         if ($secondary) {
             Write-Host ("Recommended Pair: Primary {0} ({1}) + Secondary {2} ({3})" -f $primary.Server, $primary.Provider, $secondary.Server, $secondary.Provider) -ForegroundColor Yellow
-            if ($providerOf[$primary.Server] -ne $providerOf[$secondary.Server]) {
+            if ($primary.Provider -ne $secondary.Provider) {
                 Write-Host "WARNING: Cross-family pair detected - security filtering may be inconsistent during failover." -ForegroundColor Red
             }
         } else {
@@ -354,16 +373,24 @@ $obsFloor = if ($allCleanTimes.Count -gt 0) { [math]::Round(($allCleanTimes | Me
 Write-Host ""
 Write-Host ("Baseline Performance: Instrument Overhead ~0.55 ms (Win32 Cmdlet) | This Run's Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
 
+$baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
 # Save sibling raw samples CSV
-$samplesCsv = Join-Path $PSScriptRoot ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
-$rawSamples | Export-Csv -Path $samplesCsv -NoTypeInformation -Encoding UTF8
+$samplesCsv = Join-Path $baseDir ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
+try {
+    $rawSamples | Export-Csv -Path $samplesCsv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    Write-Host ("Raw samples CSV log saved:  {0}" -f $samplesCsv)
+} catch {
+    Write-Warning ("Failed to save raw samples CSV: {0}" -f $_.Exception.Message)
+}
 
 # Save aggregate CSV with run metadata
-$csv = Join-Path $PSScriptRoot ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
-$rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
-
-Write-Host ""
-Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
-Write-Host ("Raw samples CSV log saved:  {0}" -f $samplesCsv)
+$csv = Join-Path $baseDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
+try {
+    $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
+} catch {
+    Write-Warning ("Failed to save aggregate CSV: {0}" -f $_.Exception.Message)
+}
 Write-Host "Tip: Differences in median latency under 15-20 ms are barely noticeable in normal browsing."
 Write-Host "Prioritize security features (e.g., malware blocking) and consistent max latency over small median gains."
