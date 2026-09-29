@@ -177,26 +177,34 @@ function Get-Median {
 $rows = foreach ($t in $testList) {
     $arr = $results[$t.Server].ToArray()
     if ($arr.Count -gt 0) {
+        $min = [math]::Round(($arr | Measure-Object -Minimum).Minimum, 1)
+        $med = [math]::Round((Get-Median -Values $arr), 1)
+        $avg = [math]::Round(($arr | Measure-Object -Average).Average, 1)
+        $max = [math]::Round(($arr | Measure-Object -Maximum).Maximum, 1)
+        $jitter = [math]::Round($max - $min, 1)
+
         [pscustomobject]@{
-            Provider = $t.Provider
-            Server   = $t.Server
-            Samples  = $arr.Count
-            Fail     = $fails[$t.Server]
-            Min_ms   = [math]::Round(($arr | Measure-Object -Minimum).Minimum, 1)
-            Med_ms   = [math]::Round((Get-Median -Values $arr), 1)
-            Avg_ms   = [math]::Round(($arr | Measure-Object -Average).Average, 1)
-            Max_ms   = [math]::Round(($arr | Measure-Object -Maximum).Maximum, 1)
+            Provider  = $t.Provider
+            Server    = $t.Server
+            Samples   = $arr.Count
+            Fail      = $fails[$t.Server]
+            Min_ms    = $min
+            Med_ms    = $med
+            Avg_ms    = $avg
+            Max_ms    = $max
+            Jitter_ms = $jitter
         }
     } else {
         [pscustomobject]@{
-            Provider = $t.Provider
-            Server   = $t.Server
-            Samples  = 0
-            Fail     = $fails[$t.Server]
-            Min_ms   = -1
-            Med_ms   = -1
-            Avg_ms   = -1
-            Max_ms   = -1
+            Provider  = $t.Provider
+            Server    = $t.Server
+            Samples   = 0
+            Fail      = $fails[$t.Server]
+            Min_ms    = -1
+            Med_ms    = -1
+            Avg_ms    = -1
+            Max_ms    = -1
+            Jitter_ms = -1
         }
     }
 }
@@ -208,29 +216,71 @@ Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
 $rows | Format-Table -AutoSize
 
-# Recommend matched family pair
+# Evaluate family pairs for smart recommendations (Stability vs. Speed)
 $clean = @($rows | Where-Object { $_.Fail -eq 0 -and $_.Samples -gt 0 })
 if ($clean.Count -ge 1) {
-    $primary = $clean[0]
-    $secondary = $null
+    $evaluatedPairs = [System.Collections.Generic.List[psobject]]::new()
+    $seenFamilies = @{}
 
-    if ($providerOf.ContainsKey($primary.Server)) {
-        $famName = $providerOf[$primary.Server]
-        $partnerIps = @($families[$famName] | Where-Object { $_ -ne $primary.Server })
-        $secondary = $clean | Where-Object { $_.Server -in $partnerIps } | Select-Object -First 1
+    foreach ($s in $clean) {
+        if ($providerOf.ContainsKey($s.Server)) {
+            $fam = $providerOf[$s.Server]
+            if ($seenFamilies.ContainsKey($fam)) { continue }
+            $seenFamilies[$fam] = $true
+
+            $partnerIps = @($families[$fam] | Where-Object { $_ -ne $s.Server })
+            $partner = $clean | Where-Object { $_.Server -in $partnerIps } | Select-Object -First 1
+
+            if ($partner) {
+                $pri = if ($s.Med_ms -le $partner.Med_ms) { $s } else { $partner }
+                $sec = if ($s.Med_ms -le $partner.Med_ms) { $partner } else { $s }
+                $pairMax = [math]::Max($pri.Max_ms, $sec.Max_ms)
+                $pairMed = [math]::Round(($pri.Med_ms + $sec.Med_ms) / 2, 1)
+                $pairJitter = [math]::Max($pri.Jitter_ms, $sec.Jitter_ms)
+
+                $evaluatedPairs.Add([pscustomobject]@{
+                    Family     = $fam
+                    Primary    = $pri
+                    Secondary  = $sec
+                    PairMax    = $pairMax
+                    PairMed    = $pairMed
+                    PairJitter = $pairJitter
+                })
+            }
+        }
     }
 
-    if (-not $secondary -and $clean.Count -ge 2) {
-        $secondary = $clean[1]
-    }
+    Write-Host "=== RECOMMENDATIONS ===" -ForegroundColor Yellow
 
-    if ($secondary) {
-        Write-Host ("Recommended pair: Primary {0} ({1}) + Secondary {2} ({3})" -f $primary.Server, $primary.Provider, $secondary.Server, $secondary.Provider) -ForegroundColor Yellow
-        if ($providerOf[$primary.Server] -ne $providerOf[$secondary.Server]) {
-            Write-Host "WARNING: Cross-family pair detected - security filtering may be inconsistent during failover." -ForegroundColor Red
+    if ($evaluatedPairs.Count -gt 0) {
+        $stablePair = $evaluatedPairs | Sort-Object PairMax, PairJitter | Select-Object -First 1
+        $fastestPair = $evaluatedPairs | Sort-Object PairMed | Select-Object -First 1
+
+        if ($stablePair.Family -eq $fastestPair.Family) {
+            Write-Host ("Recommended Pair (Fastest & Most Stable): Primary {0} + Secondary {1} ({2})" -f $stablePair.Primary.Server, $stablePair.Secondary.Server, $stablePair.Family) -ForegroundColor Green
+            Write-Host ("  Profile: Median {0} ms | Max {1} ms | Jitter {2} ms" -f $stablePair.PairMed, $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("1. Most Stable Pair (Recommended for Coding, Work & Daily Use):" ) -ForegroundColor Green
+            Write-Host ("   Primary {0} + Secondary {1} ({2})" -f $stablePair.Primary.Server, $stablePair.Secondary.Server, $stablePair.Family) -ForegroundColor White
+            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). Zero multi-second freezes." -f $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
+
+            Write-Host ("`n2. Fastest Raw Median (Lower Base Ping, but Spiky):" ) -ForegroundColor Cyan
+            Write-Host ("   Primary {0} + Secondary {1} ({2})" -f $fastestPair.Primary.Server, $fastestPair.Secondary.Server, $fastestPair.Family) -ForegroundColor White
+            $spikeNotice = if ($fastestPair.PairMax -gt 250) { " [Notice: Experienced spikes up to {0} ms]" -f $fastestPair.PairMax } else { "" }
+            Write-Host ("   Profile: Median {0} ms, Max {1} ms, Jitter {2} ms{3}" -f $fastestPair.PairMed, $fastestPair.PairMax, $fastestPair.PairJitter, $spikeNotice) -ForegroundColor DarkGray
         }
     } else {
-        Write-Host ("Only one server completed without failure: {0} ({1})." -f $primary.Server, $primary.Provider) -ForegroundColor Yellow
+        # Fallback if no matching family pair exists in custom servers list
+        $primary = $clean[0]
+        $secondary = if ($clean.Count -ge 2) { $clean[1] } else { $null }
+        if ($secondary) {
+            Write-Host ("Recommended Pair: Primary {0} ({1}) + Secondary {2} ({3})" -f $primary.Server, $primary.Provider, $secondary.Server, $secondary.Provider) -ForegroundColor Yellow
+            if ($providerOf[$primary.Server] -ne $providerOf[$secondary.Server]) {
+                Write-Host "WARNING: Cross-family pair detected - security filtering may be inconsistent during failover." -ForegroundColor Red
+            }
+        } else {
+            Write-Host ("Only one server completed without failure: {0} ({1})." -f $primary.Server, $primary.Provider) -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host "No servers completed without failures. Please verify your internet connection or server list." -ForegroundColor Red

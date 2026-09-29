@@ -11,8 +11,11 @@ Runs via double-click wrapper (`dns-bench.bat`) or directly in PowerShell, compa
 - **Active System DNS Baseline:** Automatically detects and benchmarks DNS resolvers configured on currently connected network adapters (`Status = 'Up'`). Inactive or disconnected adapters (e.g. stale Wi-Fi or VPN profiles) are ignored.
 - **Interleaved Testing:** Queries servers round-robin using identical domains per round, ensuring connection spikes or jitter affect all resolvers equally.
 - **Cache Warm-Up Discard:** Discards the initial test round to eliminate cold-cache penalties and startup latency.
-- **Comprehensive Metrics:** Measures and displays `Min`, `Median`, `Average`, `Max`, and failure count per resolver. Failed or unreachable servers sort cleanly to the bottom.
-- **Family-Aware Pairing:** Recommends a primary resolver and automatically pairs it with its sibling secondary resolver from the same provider family, preventing filtering leaks during failovers.
+- **Comprehensive Metrics:** Measures and displays `Min`, `Median`, `Average`, `Max`, `Jitter` (spread), and failure count per resolver. Failed or unreachable servers sort cleanly to the bottom.
+- **Dual Smart Recommendations (Stability vs. Speed):**
+  - **Most Stable Pair:** Recommends the family pair with the lowest maximum latency and minimal jitter (best for coding, work, streaming, and daily browsing without lag spikes).
+  - **Fastest Raw Median:** Identifies the lowest base ping pair while flagging multi-second latency spikes if detected.
+- **Family-Aware Pairing:** Always pairs a primary resolver with its sibling secondary resolver from the same provider family, preventing filtering leaks during failovers.
 - **CSV Logging:** Automatically saves results with timestamps (`dns-bench-yyyyMMdd-HHmmss.csv`) for record keeping. Historical baseline runs can be archived in the `results/` folder for daytime vs. peak-hour comparisons.
 - **100% Safe & Read-Only:** Only sends standard DNS queries via native `Resolve-DnsName`. Does **not** modify adapter settings, flush cache, touch the registry, or require Administrator privileges.
 
@@ -64,7 +67,6 @@ Optional parameters:
 
 ## Analysis Tips
 
-- **Median vs. Average:** Always compare the **Med_ms** (median) column rather than the average, as median is immune to occasional network spikes.
-- **Latency Spikes:** Check the **Max_ms** column. Resolvers with high maximum latency (e.g. several seconds) will cause noticeable browsing freezes.
-- **Human Perception:** A difference under 15–20 ms is rarely noticeable during daily web browsing. Prioritize security features (e.g., Quad9) and low jitter over small median gains.
+- **Median vs. Jitter:** Always check both **Med_ms** (typical speed) and **Jitter_ms** / **Max_ms** (consistency). A resolver with a 45 ms median but a 7,000 ms spike will feel much worse than a steady 60 ms resolver with a 75 ms max.
+- **Human Perception:** A difference under 15–20 ms is rarely noticeable during daily web browsing. Prioritize stability and security features over negligible median gains.
 - **Family Pairing:** If you use a security or ad-blocking resolver, ensure both primary and secondary DNS use the same provider to avoid security leaks during failovers.
