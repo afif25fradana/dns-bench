@@ -161,6 +161,8 @@ $totalWarmupQueries = $Domains.Count * $testList.Count
 $totalScoredQueries = $Passes * $Domains.Count * $testList.Count
 $totalQueries = $totalWarmupQueries + $totalScoredQueries
 $queryIdx = 0
+$origTitle = $null
+try { $origTitle = $Host.UI.RawUI.WindowTitle } catch {}
 
 Write-Host ("Starting benchmark: {0} servers, {1} passes x {2} domains ({3} scored queries/server) + 1 warm-up pass...`n" -f $testList.Count, $Passes, $Domains.Count, ($Passes * $Domains.Count)) -ForegroundColor Cyan
 
@@ -178,10 +180,19 @@ foreach ($domain in $Domains) {
         $pos++
         $queryIdx++
         $pct = [math]::Min(100, [math]::Round(($queryIdx / $totalQueries) * 100))
+        $elapsedSec = ((Get-Date) - $startTime).TotalSeconds
+        $avgSec = if ($queryIdx -gt 1) { $elapsedSec / $queryIdx } else { 0.2 }
+        $secRemaining = [math]::Max(0, [int][math]::Round(($totalQueries - $queryIdx) * $avgSec))
+
+        try {
+            $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Warm-up ({0}%)" -f $pct)
+        } catch {}
+
         Write-Progress -Activity "DNS Benchmark" `
             -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
             -CurrentOperation ("Testing {0} ({1})..." -f $t.Provider, $t.Server) `
-            -PercentComplete $pct
+            -PercentComplete $pct `
+            -SecondsRemaining $secRemaining
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $ok = $true
@@ -197,7 +208,8 @@ foreach ($domain in $Domains) {
         Write-Progress -Activity "DNS Benchmark" `
             -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
             -CurrentOperation ("Testing {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
-            -PercentComplete $pct
+            -PercentComplete $pct `
+            -SecondsRemaining $secRemaining
 
         $rawSamples.Add([pscustomobject]@{
             Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -230,10 +242,19 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
             $pos++
             $queryIdx++
             $pct = [math]::Min(100, [math]::Round(($queryIdx / $totalQueries) * 100))
+            $elapsedSec = ((Get-Date) - $startTime).TotalSeconds
+            $avgSec = if ($queryIdx -gt 1) { $elapsedSec / $queryIdx } else { 0.2 }
+            $secRemaining = [math]::Max(0, [int][math]::Round(($totalQueries - $queryIdx) * $avgSec))
+
+            try {
+                $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Pass {0}/{1} ({2}%)" -f $pass, $Passes, $pct)
+            } catch {}
+
             Write-Progress -Activity "DNS Benchmark" `
                 -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
                 -CurrentOperation ("Querying {0} ({1})..." -f $t.Provider, $t.Server) `
-                -PercentComplete $pct
+                -PercentComplete $pct `
+                -SecondsRemaining $secRemaining
 
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $ok = $true
@@ -249,7 +270,8 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
             Write-Progress -Activity "DNS Benchmark" `
                 -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
                 -CurrentOperation ("Querying {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
-                -PercentComplete $pct
+                -PercentComplete $pct `
+                -SecondsRemaining $secRemaining
 
             if ($ok) {
                 $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds)
@@ -278,6 +300,9 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
 }
 
 Write-Progress -Activity "DNS Benchmark" -Completed
+try {
+    if ($origTitle) { $Host.UI.RawUI.WindowTitle = $origTitle }
+} catch {}
 
 function Get-Median {
     param([double[]]$Values)
@@ -296,7 +321,18 @@ $rows = foreach ($t in $testList) {
         $med = [math]::Round((Get-Median -Values $arr), 1)
         $avg = [math]::Round(($arr | Measure-Object -Average).Average, 1)
         $max = [math]::Round(($arr | Measure-Object -Maximum).Maximum, 1)
-        $jitter = [math]::Round($max - $min, 1)
+        $cleanArr = @($arr | Where-Object { $_ -lt 1000 })
+        $jitter = if ($cleanArr.Count -ge 2) {
+            $diffSum = 0
+            for ($i = 0; $i -lt ($cleanArr.Count - 1); $i++) {
+                $diffSum += [math]::Abs($cleanArr[$i + 1] - $cleanArr[$i])
+            }
+            [math]::Round($diffSum / ($cleanArr.Count - 1), 1)
+        } elseif ($cleanArr.Count -eq 1) {
+            0.0
+        } else {
+            [math]::Round($max - $min, 1)
+        }
 
         [pscustomobject]@{
             Provider  = $t.Provider
@@ -408,9 +444,13 @@ Write-Host ""
 Write-Host ("Baseline Performance: Instrument Overhead ~0.55 ms (Win32 Cmdlet) | This Run's Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
 
 $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$outDir = Join-Path $baseDir 'results'
+if (-not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+}
 
 # Save sibling raw samples CSV
-$samplesCsv = Join-Path $baseDir ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
+$samplesCsv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
 try {
     $rawSamples | Export-Csv -Path $samplesCsv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     Write-Host ("Raw samples CSV log saved:  {0}" -f $samplesCsv)
@@ -419,7 +459,7 @@ try {
 }
 
 # Save aggregate CSV with run metadata
-$csv = Join-Path $baseDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
+$csv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
 try {
     $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
