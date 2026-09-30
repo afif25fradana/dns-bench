@@ -341,11 +341,15 @@ $rows = foreach ($t in $testList) {
             [math]::Round($max - $min, 1)
         }
 
+        $totalAttempts = $arr.Count + $fails[$t.Server]
+        $lossPct = if ($totalAttempts -gt 0) { [math]::Round(($fails[$t.Server] / $totalAttempts) * 100, 1) } else { 0.0 }
+
         [pscustomobject]@{
             Provider  = $t.Provider
             Server    = $t.Server
             Samples   = $arr.Count
             Fail      = $fails[$t.Server]
+            Loss_pct  = $lossPct
             Min_ms    = $min
             Med_ms    = $med
             Avg_ms    = $avg
@@ -358,6 +362,7 @@ $rows = foreach ($t in $testList) {
             Server    = $t.Server
             Samples   = 0
             Fail      = $fails[$t.Server]
+            Loss_pct  = if ($fails[$t.Server] -gt 0) { 100.0 } else { 0.0 }
             Min_ms    = -1
             Med_ms    = -1
             Avg_ms    = -1
@@ -367,15 +372,22 @@ $rows = foreach ($t in $testList) {
     }
 }
 
-# Sort: 0-failure servers first (by median latency), followed by servers with failures
-$rows = @($rows | Sort-Object @{ Expression = "Fail"; Ascending = $true }, @{ Expression = { if ($_.Med_ms -lt 0) { [double]::MaxValue } else { $_.Med_ms } }; Ascending = $true })
+# Sort: eligible servers (Loss <= 10% and Med_ms > 0) by median; then ineligible servers by Fail count, then median
+$eligible = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 } | Sort-Object Med_ms)
+$ineligible = @($rows | Where-Object { -not ($_.Loss_pct -le 10 -and $_.Med_ms -gt 0) } | Sort-Object Fail, @{ Expression = { if ($_.Med_ms -lt 0) { [double]::MaxValue } else { $_.Med_ms } } })
+$rows = @($eligible + $ineligible)
 
 Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
 $rows | Format-Table -AutoSize
 
+function Get-ServerBadge([pscustomobject]$s) {
+    if ($s.Fail -eq 0) { return "[Zero-Loss]" }
+    return ("({0}% loss)" -f $s.Loss_pct)
+}
+
 # Evaluate family pairs for smart recommendations (Stability vs. Speed)
-$clean = @($rows | Where-Object { $_.Fail -eq 0 -and $_.Samples -gt 0 })
+$clean = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 })
 if ($clean.Count -ge 1) {
     $evaluatedPairs = [System.Collections.Generic.List[psobject]]::new()
     $seenFamilies = @{}
@@ -415,15 +427,15 @@ if ($clean.Count -ge 1) {
         $fastestPair = $evaluatedPairs | Sort-Object PairMed | Select-Object -First 1
 
         if ($stablePair.Family -eq $fastestPair.Family) {
-            Write-Host ("Recommended Pair (Fastest & Most Stable): Primary {0} + Secondary {1} ({2})" -f $stablePair.Primary.Server, $stablePair.Secondary.Server, $stablePair.Family) -ForegroundColor Green
+            Write-Host ("Recommended Pair (Fastest & Most Stable): Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor Green
             Write-Host ("  Profile: Median {0} ms | Max {1} ms | Jitter {2} ms" -f $stablePair.PairMed, $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
         } else {
             Write-Host ("1. Most Stable Pair (Recommended for Coding, Work & Daily Use):" ) -ForegroundColor Green
-            Write-Host ("   Primary {0} + Secondary {1} ({2})" -f $stablePair.Primary.Server, $stablePair.Secondary.Server, $stablePair.Family) -ForegroundColor White
+            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor White
             Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). Zero multi-second freezes." -f $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
 
             Write-Host ("`n2. Fastest Raw Median (Lower Base Ping, but Spiky):" ) -ForegroundColor Cyan
-            Write-Host ("   Primary {0} + Secondary {1} ({2})" -f $fastestPair.Primary.Server, $fastestPair.Secondary.Server, $fastestPair.Family) -ForegroundColor White
+            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $fastestPair.Primary.Server, (Get-ServerBadge $fastestPair.Primary), $fastestPair.Secondary.Server, (Get-ServerBadge $fastestPair.Secondary), $fastestPair.Family) -ForegroundColor White
             $spikeNotice = if ($fastestPair.PairMax -gt 250) { " [Notice: Experienced spikes up to {0} ms]" -f $fastestPair.PairMax } else { "" }
             Write-Host ("   Profile: Median {0} ms, Max {1} ms, Jitter {2} ms{3}" -f $fastestPair.PairMed, $fastestPair.PairMax, $fastestPair.PairJitter, $spikeNotice) -ForegroundColor DarkGray
         }
@@ -432,16 +444,16 @@ if ($clean.Count -ge 1) {
         $primary = $clean[0]
         $secondary = if ($clean.Count -ge 2) { $clean[1] } else { $null }
         if ($secondary) {
-            Write-Host ("Recommended Pair: Primary {0} ({1}) + Secondary {2} ({3})" -f $primary.Server, $primary.Provider, $secondary.Server, $secondary.Provider) -ForegroundColor Yellow
+            Write-Host ("Recommended Pair: Primary {0} {1} ({2}) + Secondary {3} {4} ({5})" -f $primary.Server, (Get-ServerBadge $primary), $primary.Provider, $secondary.Server, (Get-ServerBadge $secondary), $secondary.Provider) -ForegroundColor Yellow
             if ($primary.Provider -ne $secondary.Provider) {
                 Write-Host "WARNING: Cross-family pair detected - security filtering may be inconsistent during failover." -ForegroundColor Red
             }
         } else {
-            Write-Host ("Only one server completed without failure: {0} ({1})." -f $primary.Server, $primary.Provider) -ForegroundColor Yellow
+            Write-Host ("Only one server met stability criteria: {0} {1} ({2})." -f $primary.Server, (Get-ServerBadge $primary), $primary.Provider) -ForegroundColor Yellow
         }
     }
 } else {
-    Write-Host "No servers completed without failures. Please verify your internet connection or server list." -ForegroundColor Red
+    Write-Host "No servers met the stability criteria (<=10% loss). Please verify your internet connection or server list." -ForegroundColor Red
 }
 
 $allCleanTimes = @($results.Values | ForEach-Object { $_ } | Where-Object { $_ -gt 0 })
