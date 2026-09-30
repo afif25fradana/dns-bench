@@ -8,6 +8,12 @@ Measures latency, within-domain jitter, and packet loss across public DNS resolv
 .PARAMETER Passes
 Number of test passes per domain (default: 5). Aliased to 'Rounds'.
 
+.PARAMETER Quick
+Runs a fast benchmark with 2 passes and 4 domains (ideal for quick pre-work checks).
+
+.PARAMETER SleepMs
+Delay in milliseconds between individual DNS queries (default: 25). Prevents flooding while running fast.
+
 .PARAMETER Servers
 Array of DNS server IP addresses to benchmark. If omitted, benchmarks default public resolvers and active System DNS.
 
@@ -15,7 +21,7 @@ Array of DNS server IP addresses to benchmark. If omitted, benchmarks default pu
 Array of DNS server IP addresses to exclude from benchmarking.
 
 .PARAMETER Domains
-Array of domain names to query during benchmark passes (default: www.google.com, www.cloudflare.com, www.wikipedia.org, www.microsoft.com).
+Array of domain names to query during benchmark passes (default: www.google.com, www.cloudflare.com, www.wikipedia.org, www.microsoft.com, github.com, www.youtube.com, www.reddit.com, www.amazon.com).
 
 .EXAMPLE
 .\dns-bench.ps1
@@ -29,20 +35,95 @@ Array of domain names to query during benchmark passes (default: www.google.com,
 #Requires -Version 5.1
 
 param(
-    [Alias('Rounds')]
     [ValidateRange(1, [int]::MaxValue)]
+    [Alias('Rounds')]
     [int]$Passes = 5,
+    [switch]$Quick,
+    [ValidateRange(0, 1000)]
+    [int]$SleepMs = 25,
     [string[]]$Servers = @(),
     [string[]]$ExcludeServers = @(),
     [string[]]$Domains = @(
         'www.google.com',
         'www.cloudflare.com',
         'www.wikipedia.org',
-        'www.microsoft.com'
+        'www.microsoft.com',
+        'github.com',
+        'www.youtube.com',
+        'www.reddit.com',
+        'www.amazon.com'
     )
 )
 
+if ($Quick) {
+    if (-not $PSBoundParameters.ContainsKey('Passes') -and -not $PSBoundParameters.ContainsKey('Rounds')) {
+        $Passes = 2
+    }
+    if (-not $PSBoundParameters.ContainsKey('Domains')) {
+        $Domains = @('www.google.com', 'www.cloudflare.com', 'github.com', 'www.microsoft.com')
+    }
+}
+
 $ErrorActionPreference = 'SilentlyContinue'
+
+function ConvertFrom-CsvParam([string[]]$Values) {
+    $Values | ForEach-Object { ($_ -split ',') } | ForEach-Object { $_.Trim(" `"'") } | Where-Object { $_ }
+}
+
+function Get-RotatedList($List, [int]$Offset) {
+    if ($Offset -eq 0) { return $List }
+    @($List[$Offset..($List.Count - 1)]) + @($List[0..($Offset - 1)])
+}
+
+function Invoke-DnsQuery {
+    param(
+        [pscustomobject]$Target,
+        [string]$Domain,
+        $PassLabel,
+        [string]$ProgressStatus,
+        [int]$Pct,
+        [int]$SecondsRemaining,
+        [int]$Pos,
+        [switch]$Score
+    )
+    $verb = if ($Score) { 'Querying' } else { 'Testing' }
+    Write-Progress -Activity 'DNS Benchmark' `
+        -Status $ProgressStatus `
+        -CurrentOperation ('{0} {1} ({2})...' -f $verb, $Target.Provider, $Target.Server) `
+        -PercentComplete $Pct `
+        -SecondsRemaining $SecondsRemaining
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $ok = $true; $errId = ''
+    try {
+        Resolve-DnsName -Name $Domain -Server $Target.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
+    }
+    catch { $ok = $false; $errId = $_.FullyQualifiedErrorId }
+    $sw.Stop()
+
+    Write-Progress -Activity 'DNS Benchmark' `
+        -Status $ProgressStatus `
+        -CurrentOperation ('{0} {1} ({2}) -> {3}' -f $verb, $Target.Provider, $Target.Server, $(if ($ok) { '{0} ms' -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { 'Failed' })) `
+        -PercentComplete $Pct `
+        -SecondsRemaining $SecondsRemaining
+
+    if ($Score) {
+        if ($ok) { $script:results[$Target.Server].Add($sw.Elapsed.TotalMilliseconds) }
+        else { $script:fails[$Target.Server]++ }
+    }
+    $script:rawSamples.Add([pscustomobject]@{
+        Timestamp  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+        Pass       = $PassLabel
+        Position   = $Pos
+        Domain     = $Domain
+        Server     = $Target.Server
+        Provider   = $Target.Provider
+        Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
+        Status     = if ($ok) { 'Success' } else { 'Fail' }
+        ErrorId    = $errId
+    })
+    if ($SleepMs -gt 0) { Start-Sleep -Milliseconds $SleepMs }
+}
 
 # Resolver families (used for provider labels and matched family recommendation)
 $families = @{
@@ -64,16 +145,7 @@ foreach ($fam in $families.Keys) {
 }
 
 # Normalize Domains parameter inputs (supports comma-separated strings)
-$flatDomains = @()
-foreach ($d in $Domains) {
-    if ($d) {
-        ($d -split ',') | ForEach-Object {
-            $cleaned = $_.Trim(" `"'")
-            if ($cleaned) { $flatDomains += $cleaned }
-        }
-    }
-}
-if ($flatDomains.Count -gt 0) { $Domains = $flatDomains }
+$Domains = @(ConvertFrom-CsvParam $Domains)
 
 # Pre-flight internet connectivity check
 $preflightDomain = if ($Domains.Count -gt 0) { $Domains[0] } else { 'www.google.com' }
@@ -81,7 +153,8 @@ Write-Host ("Checking internet connectivity ({0})..." -f $preflightDomain) -Fore
 $online = $false
 try {
     if (Resolve-DnsName -Name $preflightDomain -Type A -DnsOnly -NoHostsFile -ErrorAction Stop) { $online = $true }
-} catch {
+}
+catch {
     foreach ($probe in @('1.1.1.1', '8.8.8.8')) {
         try {
             if (Resolve-DnsName -Name $preflightDomain -Server $probe -Type A -DnsOnly -NoHostsFile -ErrorAction Stop) {
@@ -89,7 +162,8 @@ try {
                 $online = $true
                 break
             }
-        } catch {}
+        }
+        catch {}
     }
 }
 
@@ -100,43 +174,27 @@ if (-not $online) {
 
 # Detect active system DNS servers from connected adapters only (Status = 'Up')
 $systemDns = @{}   # IP -> InterfaceAlias
+$activeAdapter = $null
 $upIdx = @(Get-NetAdapter -ErrorAction SilentlyContinue |
     Where-Object { $_.Status -eq 'Up' } |
     Select-Object -ExpandProperty InterfaceIndex)
 
 foreach ($a in (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
     if ($upIdx -notcontains $a.InterfaceIndex) { continue }
+    if (-not $activeAdapter) { $activeAdapter = $a.InterfaceAlias }
     foreach ($ip in $a.ServerAddresses) {
         if ($ip -and $ip -notlike 'fec0:*' -and $ip -ne '127.0.0.1' -and $ip -notlike '169.254.*') {
             if (-not $systemDns.ContainsKey($ip)) {
                 $systemDns[$ip] = $a.InterfaceAlias
+                $activeAdapter = $a.InterfaceAlias
             }
         }
     }
 }
 
 # Normalize Servers and ExcludeServers parameter inputs (supports comma-separated strings)
-$flatServers = @()
-foreach ($s in $Servers) {
-    if ($s) {
-        ($s -split ',') | ForEach-Object {
-            $cleaned = $_.Trim(" `"'")
-            if ($cleaned) { $flatServers += $cleaned }
-        }
-    }
-}
-$Servers = $flatServers
-
-$flatExclude = @()
-foreach ($e in $ExcludeServers) {
-    if ($e) {
-        ($e -split ',') | ForEach-Object {
-            $cleaned = $_.Trim(" `"'")
-            if ($cleaned) { $flatExclude += $cleaned }
-        }
-    }
-}
-$ExcludeServers = $flatExclude
+$Servers = @(ConvertFrom-CsvParam $Servers)
+$ExcludeServers = @(ConvertFrom-CsvParam $ExcludeServers)
 
 # Assemble test targets (filtering with ExcludeServers and deduplicating system vs public)
 $testList = [System.Collections.Generic.List[psobject]]::new()
@@ -170,7 +228,8 @@ foreach ($ip in $systemDns.Keys) {
 if ($systemDns.Count -gt 0) {
     $sysSummary = ($systemDns.Keys | ForEach-Object { "{0} [{1}]" -f $_, $systemDns[$_] }) -join ', '
     Write-Host ("Detected active System DNS (Up adapters): {0}" -f $sysSummary) -ForegroundColor DarkGray
-} else {
+}
+else {
     Write-Host "No active System DNS detected on Up adapters; benchmarking public resolvers only." -ForegroundColor DarkGray
 }
 
@@ -180,10 +239,10 @@ if ($testList.Count -eq 0) {
 }
 # Benchmark execution with interleaved round-robin queries
 $results = @{}
-$fails   = @{}
+$fails = @{}
 foreach ($t in $testList) {
     $results[$t.Server] = [System.Collections.Generic.List[double]]::new()
-    $fails[$t.Server]   = 0
+    $fails[$t.Server] = 0
 }
 
 $startTime = Get-Date
@@ -192,8 +251,7 @@ $totalWarmupQueries = $Domains.Count * $testList.Count
 $totalScoredQueries = $Passes * $Domains.Count * $testList.Count
 $totalQueries = $totalWarmupQueries + $totalScoredQueries
 $queryIdx = 0
-$origTitle = $null
-try { $origTitle = $Host.UI.RawUI.WindowTitle } catch {}
+$origTitle = try { $Host.UI.RawUI.WindowTitle } catch { $null }
 
 Write-Host ("Starting benchmark: {0} servers, {1} passes x {2} domains ({3} scored queries/server) + 1 warm-up pass...`n" -f $testList.Count, $Passes, $Domains.Count, ($Passes * $Domains.Count)) -ForegroundColor Cyan
 
@@ -202,9 +260,7 @@ $sweep = 0
 Write-Host "Running warm-up pass across all domains (cache priming, discarded)..." -ForegroundColor DarkGray
 foreach ($domain in $Domains) {
     Write-Host ("  [Warm-up] Priming cache for {0} across {1} servers..." -f $domain, $testList.Count) -ForegroundColor DarkGray
-    $offset = $sweep % $testList.Count
-    $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
-    $currentSweep = $sweep
+    $roundServers = Get-RotatedList $testList ($sweep % $testList.Count)
     $sweep++
     $pos = 0
     foreach ($t in $roundServers) {
@@ -214,47 +270,9 @@ foreach ($domain in $Domains) {
         $elapsedSec = ((Get-Date) - $startTime).TotalSeconds
         $avgSec = if ($queryIdx -gt 1) { $elapsedSec / $queryIdx } else { 0.2 }
         $secRemaining = [math]::Max(0, [int][math]::Round(($totalQueries - $queryIdx) * $avgSec))
-
-        try {
-            $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Warm-up ({0}%)" -f $pct)
-        } catch {}
-
-        Write-Progress -Activity "DNS Benchmark" `
-            -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
-            -CurrentOperation ("Testing {0} ({1})..." -f $t.Provider, $t.Server) `
-            -PercentComplete $pct `
-            -SecondsRemaining $secRemaining
-
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $ok = $true
-        $errId = ""
-        try {
-            Resolve-DnsName -Name $domain -Server $t.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
-        } catch {
-            $ok = $false
-            $errId = $_.FullyQualifiedErrorId
-        }
-        $sw.Stop()
-
-        Write-Progress -Activity "DNS Benchmark" `
-            -Status ("Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain) `
-            -CurrentOperation ("Testing {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
-            -PercentComplete $pct `
-            -SecondsRemaining $secRemaining
-
-        $rawSamples.Add([pscustomobject]@{
-            Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
-            Pass       = "Warmup"
-            SweepIndex = $currentSweep
-            Position   = $pos
-            Domain     = $domain
-            Server     = $t.Server
-            Provider   = $t.Provider
-            Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
-            Status     = if ($ok) { "Success" } else { "Fail" }
-            ErrorId    = $errId
-        })
-        Start-Sleep -Milliseconds 100
+        try { $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Warm-up ({0}%)" -f $pct) } catch {}
+        $status = "Warm-up ({0}/{1} queries) | Domain: {2}" -f $queryIdx, $totalQueries, $domain
+        Invoke-DnsQuery -Target $t -Domain $domain -PassLabel 'Warmup' -ProgressStatus $status -Pct $pct -SecondsRemaining $secRemaining -Pos $pos
     }
 }
 Write-Host "Warm-up pass finished.`n" -ForegroundColor DarkGray
@@ -264,9 +282,7 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
     $passStartTime = Get-Date
     foreach ($domain in $Domains) {
         Write-Host ("  [Pass {0}/{1}] Testing domain: {2}..." -f $pass, $Passes, $domain) -ForegroundColor DarkGray
-        $offset = $sweep % $testList.Count
-        $roundServers = if ($offset -eq 0) { $testList } else { @($testList[$offset..($testList.Count - 1)]) + @($testList[0..($offset - 1)]) }
-        $currentSweep = $sweep
+        $roundServers = Get-RotatedList $testList ($sweep % $testList.Count)
         $sweep++
         $pos = 0
         foreach ($t in $roundServers) {
@@ -276,53 +292,9 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
             $elapsedSec = ((Get-Date) - $startTime).TotalSeconds
             $avgSec = if ($queryIdx -gt 1) { $elapsedSec / $queryIdx } else { 0.2 }
             $secRemaining = [math]::Max(0, [int][math]::Round(($totalQueries - $queryIdx) * $avgSec))
-
-            try {
-                $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Pass {0}/{1} ({2}%)" -f $pass, $Passes, $pct)
-            } catch {}
-
-            Write-Progress -Activity "DNS Benchmark" `
-                -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
-                -CurrentOperation ("Querying {0} ({1})..." -f $t.Provider, $t.Server) `
-                -PercentComplete $pct `
-                -SecondsRemaining $secRemaining
-
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $ok = $true
-            $errId = ""
-            try {
-                Resolve-DnsName -Name $domain -Server $t.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
-            } catch {
-                $ok = $false
-                $errId = $_.FullyQualifiedErrorId
-            }
-            $sw.Stop()
-
-            Write-Progress -Activity "DNS Benchmark" `
-                -Status ("Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain) `
-                -CurrentOperation ("Querying {0} ({1}) -> {2}" -f $t.Provider, $t.Server, (if ($ok) { "{0} ms" -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { "Failed" })) `
-                -PercentComplete $pct `
-                -SecondsRemaining $secRemaining
-
-            if ($ok) {
-                $results[$t.Server].Add($sw.Elapsed.TotalMilliseconds)
-            } else {
-                $fails[$t.Server]++
-            }
-
-            $rawSamples.Add([pscustomobject]@{
-                Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
-                Pass       = $pass
-                SweepIndex = $currentSweep
-                Position   = $pos
-                Domain     = $domain
-                Server     = $t.Server
-                Provider   = $t.Provider
-                Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
-                Status     = if ($ok) { "Success" } else { "Fail" }
-                ErrorId    = $errId
-            })
-            Start-Sleep -Milliseconds 100
+            try { $Host.UI.RawUI.WindowTitle = ("DNS Benchmark - Pass {0}/{1} ({2}%)" -f $pass, $Passes, $pct) } catch {}
+            $status = "Pass {0}/{1} ({2}% complete) | Domain: {3}" -f $pass, $Passes, $pct, $domain
+            Invoke-DnsQuery -Target $t -Domain $domain -PassLabel $pass -ProgressStatus $status -Pct $pct -SecondsRemaining $secRemaining -Pos $pos -Score
         }
     }
     $passElapsed = (Get-Date) - $passStartTime
@@ -333,7 +305,8 @@ for ($pass = 1; $pass -le $Passes; $pass++) {
 Write-Progress -Activity "DNS Benchmark" -Completed
 try {
     if ($origTitle) { $Host.UI.RawUI.WindowTitle = $origTitle }
-} catch {}
+}
+catch {}
 
 function Get-Median {
     param([double[]]$Values)
@@ -380,7 +353,8 @@ $rows = foreach ($t in $testList) {
             Max_ms    = $max
             Jitter_ms = $jitter
         }
-    } else {
+    }
+    else {
         [pscustomobject]@{
             Provider  = $t.Provider
             Server    = $t.Server
@@ -399,16 +373,14 @@ $rows = foreach ($t in $testList) {
 # Sort: eligible servers (Loss <= 10% and Med_ms > 0) by median; then ineligible servers by Fail count, then median
 $eligible = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 } | Sort-Object Med_ms)
 $ineligible = @($rows | Where-Object { -not ($_.Loss_pct -le 10 -and $_.Med_ms -gt 0) } | Sort-Object Fail, @{ Expression = { if ($_.Med_ms -lt 0) { [double]::MaxValue } else { $_.Med_ms } } })
-$rows = @($eligible + $ineligible)
-
 Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
-$rows | Select-Object Provider, Server, Samples, Fail, Loss_pct,
-    @{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0) { $_.Min_ms } else { '-' } } },
-    @{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0) { $_.Med_ms } else { '-' } } },
-    @{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0) { $_.Avg_ms } else { '-' } } },
-    @{ Name = 'Max_ms'; Expression = { if ($_.Samples -gt 0) { $_.Max_ms } else { '-' } } },
-    @{ Name = 'Jitter_ms'; Expression = { if ($_.Samples -gt 0) { $_.Jitter_ms } else { '-' } } } | Format-Table -AutoSize
+($eligible + $ineligible) | Select-Object Provider, Server, Samples, Fail, Loss_pct,
+@{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0) { $_.Min_ms } else { '-' } } },
+@{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0) { $_.Med_ms } else { '-' } } },
+@{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0) { $_.Avg_ms } else { '-' } } },
+@{ Name = 'Max_ms'; Expression = { if ($_.Samples -gt 0) { $_.Max_ms } else { '-' } } },
+@{ Name = 'Jitter_ms'; Expression = { if ($_.Samples -gt 0) { $_.Jitter_ms } else { '-' } } } | Format-Table -AutoSize
 
 function Get-ServerBadge([pscustomobject]$s) {
     if ($s.Fail -eq 0) { return "[Zero-Loss]" }
@@ -438,13 +410,13 @@ if ($clean.Count -ge 1) {
                 $pairJitter = [math]::Max($pri.Jitter_ms, $sec.Jitter_ms)
 
                 $evaluatedPairs.Add([pscustomobject]@{
-                    Family     = $fam
-                    Primary    = $pri
-                    Secondary  = $sec
-                    PairMax    = $pairMax
-                    PairMed    = $pairMed
-                    PairJitter = $pairJitter
-                })
+                        Family     = $fam
+                        Primary    = $pri
+                        Secondary  = $sec
+                        PairMax    = $pairMax
+                        PairMed    = $pairMed
+                        PairJitter = $pairJitter
+                    })
             }
         }
     }
@@ -454,14 +426,15 @@ if ($clean.Count -ge 1) {
     if ($evaluatedPairs.Count -gt 0) {
         $stablePair = $evaluatedPairs | Sort-Object PairMax, PairJitter | Select-Object -First 1
         $fastestPair = $evaluatedPairs | Sort-Object PairMed | Select-Object -First 1
+        $freezeNote = if ($stablePair.PairMax -lt 1000) { "Zero multi-second freezes." } else { "Multi-second spikes were observed (Max {0} ms)." -f $stablePair.PairMax }
 
         if ($stablePair.Family -eq $fastestPair.Family) {
             Write-Host ("Recommended Pair (Fastest & Most Stable): Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor Green
-            Write-Host ("  Profile: Median {0} ms | Max {1} ms | Jitter {2} ms" -f $stablePair.PairMed, $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
-        } else {
+            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). {2}" -f $stablePair.PairMax, $stablePair.PairJitter, $freezeNote) -ForegroundColor DarkGray
+        }
+        else {
             Write-Host ("1. Most Stable Pair (Recommended for Coding, Work & Daily Use):" ) -ForegroundColor Green
             Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor White
-            $freezeNote = if ($stablePair.PairMax -lt 1000) { "Zero multi-second freezes." } else { "Multi-second spikes were observed (Max {0} ms)." -f $stablePair.PairMax }
             Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). {2}" -f $stablePair.PairMax, $stablePair.PairJitter, $freezeNote) -ForegroundColor DarkGray
 
             Write-Host ("`n2. Fastest Raw Median (Lower Base Ping, but Spiky):" ) -ForegroundColor Cyan
@@ -469,7 +442,8 @@ if ($clean.Count -ge 1) {
             $spikeNotice = if ($fastestPair.PairMax -gt 250) { " [Notice: Experienced spikes up to {0} ms]" -f $fastestPair.PairMax } else { "" }
             Write-Host ("   Profile: Median {0} ms, Max {1} ms, Jitter {2} ms{3}" -f $fastestPair.PairMed, $fastestPair.PairMax, $fastestPair.PairJitter, $spikeNotice) -ForegroundColor DarkGray
         }
-    } else {
+    }
+    else {
         # Fallback if no matching family pair exists in custom servers list
         $primary = $clean[0]
         $secondary = if ($clean.Count -ge 2) { $clean[1] } else { $null }
@@ -478,41 +452,81 @@ if ($clean.Count -ge 1) {
             if ($primary.Provider -ne $secondary.Provider) {
                 Write-Host "WARNING: Cross-family pair detected - security filtering may be inconsistent during failover." -ForegroundColor Red
             }
-        } else {
+        }
+        else {
             Write-Host ("Only one server met stability criteria: {0} {1} ({2})." -f $primary.Server, (Get-ServerBadge $primary), $primary.Provider) -ForegroundColor Yellow
         }
     }
-} else {
+
+    # Compare against active System DNS
+    $sysServersInClean = @($clean | Where-Object { $systemDns.ContainsKey($_.Server) })
+    $chosenPrimary = if ($evaluatedPairs.Count -gt 0) { $stablePair.Primary } else { $primary }
+    if ($sysServersInClean.Count -gt 0 -and $chosenPrimary) {
+        $bestSys = $sysServersInClean | Sort-Object Med_ms | Select-Object -First 1
+        $diff = [math]::Round($bestSys.Med_ms - $chosenPrimary.Med_ms, 1)
+        Write-Host "`nActive System DNS Comparison:" -ForegroundColor Yellow
+        if ($bestSys.Server -eq $chosenPrimary.Server) {
+            Write-Host ("   Your active System DNS ({0}) is already the top-performing recommendation!" -f $bestSys.Server) -ForegroundColor Green
+        }
+        elseif ($diff -gt 0) {
+            $pct = [math]::Round(($diff / $bestSys.Med_ms) * 100, 1)
+            Write-Host ("   Current DNS ({0}) median: {1} ms | Recommended ({2}) median: {3} ms" -f $bestSys.Server, $bestSys.Med_ms, $chosenPrimary.Server, $chosenPrimary.Med_ms) -ForegroundColor DarkGray
+            Write-Host ("   Switching saves ~{0} ms ({1}% faster lookups)." -f $diff, $pct) -ForegroundColor Green
+        }
+        else {
+            Write-Host ("   Current DNS ({0}) median is {1} ms (already {2} ms faster than recommended pair primary {3} ms)." -f $bestSys.Server, $bestSys.Med_ms, [math]::Abs($diff), $chosenPrimary.Med_ms) -ForegroundColor Cyan
+        }
+    }
+
+    # Actionable PowerShell commands to apply / reset DNS
+    if ($activeAdapter) {
+        $recIps = if ($evaluatedPairs.Count -gt 0) {
+            "'{0}', '{1}'" -f $stablePair.Primary.Server, $stablePair.Secondary.Server
+        }
+        elseif ($secondary) {
+            "'{0}', '{1}'" -f $primary.Server, $secondary.Server
+        }
+        else {
+            "'{0}'" -f $primary.Server
+        }
+
+        Write-Host ("`nTo apply recommended DNS to '{0}' (run in Administrator PowerShell):" -f $activeAdapter) -ForegroundColor Yellow
+        Write-Host ("   Set-DnsClientServerAddress -InterfaceAlias '{0}' -ServerAddresses {1} -Validate" -f $activeAdapter, $recIps) -ForegroundColor Cyan
+        Write-Host ("To revert back to automatic (DHCP) DNS:" ) -ForegroundColor DarkGray
+        Write-Host ("   Set-DnsClientServerAddress -InterfaceAlias '{0}' -ResetServerAddresses" -f $activeAdapter) -ForegroundColor DarkGray
+    }
+}
+else {
     Write-Host "No servers met the stability criteria (<=10% loss). Please verify your internet connection or server list." -ForegroundColor Red
 }
 
-$allCleanTimes = @($results.Values | ForEach-Object { $_ } | Where-Object { $_ -gt 0 })
-$obsFloor = if ($allCleanTimes.Count -gt 0) { [math]::Round(($allCleanTimes | Measure-Object -Min).Minimum, 1) } else { 0 }
+$allCleanTimes = @($results.Values | ForEach-Object { $_ })
+$obsFloor = if ($allCleanTimes.Count -gt 0) { [math]::Round(($allCleanTimes | Measure-Object -Minimum).Minimum, 1) } else { 0 }
 
 Write-Host ""
-Write-Host ("Baseline Performance: Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
+Write-Host ("Baseline Performance: Instrument Overhead ~0.55 ms (Win32 Cmdlet) | This Run's Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
 
 $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $outDir = Join-Path $baseDir 'results'
-if (-not (Test-Path $outDir)) {
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-}
+$null = New-Item -ItemType Directory -Path $outDir -Force
 
 # Save sibling raw samples CSV
 $samplesCsv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}-samples.csv" -f $startTime)
 try {
     $rawSamples | Export-Csv -Path $samplesCsv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     Write-Host ("Raw samples CSV log saved:  {0}" -f $samplesCsv)
-} catch {
+}
+catch {
     Write-Warning ("Failed to save raw samples CSV: {0}" -f $_.Exception.Message)
 }
 
-# Save aggregate CSV summary report
+# Save aggregate CSV with run metadata
 $csv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
 try {
     $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
-} catch {
+}
+catch {
     Write-Warning ("Failed to save aggregate CSV: {0}" -f $_.Exception.Message)
 }
 Write-Host "Tip: Differences in median latency under 15-20 ms are barely noticeable in normal browsing."
