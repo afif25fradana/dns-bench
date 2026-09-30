@@ -64,8 +64,6 @@ if ($Quick) {
     }
 }
 
-$ErrorActionPreference = 'SilentlyContinue'
-
 function ConvertFrom-CsvParam([string[]]$Values) {
     $Values | ForEach-Object { ($_ -split ',') } | ForEach-Object { $_.Trim(" `"'") } | Where-Object { $_ }
 }
@@ -96,7 +94,7 @@ function Invoke-DnsQuery {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $ok = $true; $errId = ''
     try {
-        Resolve-DnsName -Name $Domain -Server $Target.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop | Out-Null
+        $null = Resolve-DnsName -Name $Domain -Server $Target.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop
     }
     catch { $ok = $false; $errId = $_.FullyQualifiedErrorId }
     $sw.Stop()
@@ -148,6 +146,12 @@ foreach ($fam in $families.Keys) {
 $Domains = @(ConvertFrom-CsvParam $Domains)
 
 # Pre-flight internet connectivity check
+$upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+if ($upAdapters.Count -eq 0) {
+    Write-Host "No active network adapters connected. Please verify your network connection." -ForegroundColor Red
+    exit 1
+}
+
 $preflightDomain = if ($Domains.Count -gt 0) { $Domains[0] } else { 'www.google.com' }
 Write-Host ("Checking internet connectivity ({0})..." -f $preflightDomain) -ForegroundColor Cyan
 $online = $false
@@ -172,21 +176,47 @@ if (-not $online) {
     exit 1
 }
 
-# Detect active system DNS servers from connected adapters only (Status = 'Up')
+# Discover active default route (0.0.0.0/0) and connected adapters (Status = 'Up')
 $systemDns = @{}   # IP -> InterfaceAlias
 $activeAdapter = $null
-$upIdx = @(Get-NetAdapter -ErrorAction SilentlyContinue |
-    Where-Object { $_.Status -eq 'Up' } |
-    Select-Object -ExpandProperty InterfaceIndex)
+$upAdapterMap = @{}
+foreach ($ad in $upAdapters) { $upAdapterMap[$ad.InterfaceIndex] = $ad }
 
-foreach ($a in (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
-    if ($upIdx -notcontains $a.InterfaceIndex) { continue }
-    if (-not $activeAdapter) { $activeAdapter = $a.InterfaceAlias }
+$defaultRoutes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+$activeRoute = $defaultRoutes |
+    Where-Object { $upAdapterMap.ContainsKey($_.InterfaceIndex) } |
+    Sort-Object { [int]$_.RouteMetric + [int]$_.InterfaceMetric } |
+    Select-Object -First 1
+
+$activeAdapterObj = if ($activeRoute) { $upAdapterMap[$activeRoute.InterfaceIndex] } else { $null }
+
+# Distinguish physical WAN vs virtual/VPN adapter
+$isPhysical = if ($activeAdapterObj) {
+    ($activeAdapterObj.HardwareInterface -and $activeAdapterObj.ConnectorPresent -and -not $activeAdapterObj.Virtual)
+} else { $false }
+
+$physicalAdapterObj = $upAdapters |
+    Where-Object { $_.HardwareInterface -and $_.ConnectorPresent -and -not $_.Virtual } |
+    Select-Object -First 1
+
+$targetAdapter = if ($isPhysical) { $activeAdapterObj } elseif ($physicalAdapterObj) { $physicalAdapterObj } else { $activeAdapterObj }
+$activeAdapter = if ($targetAdapter) { $targetAdapter.InterfaceAlias } else { $null }
+
+# Scoped DNS discovery: prioritize active gateway adapter and physical adapter
+$targetIndices = @()
+if ($activeAdapterObj) { $targetIndices += $activeAdapterObj.InterfaceIndex }
+if ($physicalAdapterObj -and (-not $activeAdapterObj -or $physicalAdapterObj.InterfaceIndex -ne $activeAdapterObj.InterfaceIndex)) {
+    $targetIndices += $physicalAdapterObj.InterfaceIndex
+}
+if ($targetIndices.Count -eq 0) {
+    $targetIndices = @($upAdapters | Select-Object -ExpandProperty InterfaceIndex)
+}
+
+foreach ($a in (Get-DnsClientServerAddress -InterfaceIndex $targetIndices -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
     foreach ($ip in $a.ServerAddresses) {
-        if ($ip -and $ip -notlike 'fec0:*' -and $ip -ne '127.0.0.1' -and $ip -notlike '169.254.*') {
+        if ($ip -and $ip -notlike 'fec0:*' -and $ip -notlike '127.*' -and $ip -notlike '169.254.*' -and $ip -ne '0.0.0.0') {
             if (-not $systemDns.ContainsKey($ip)) {
                 $systemDns[$ip] = $a.InterfaceAlias
-                $activeAdapter = $a.InterfaceAlias
             }
         }
     }
@@ -317,14 +347,30 @@ function Get-Median {
     return ($sorted[$mid] + $sorted[$mid + 1]) / 2
 }
 
+function Get-Percentile {
+    param([double[]]$Values, [double]$Percentile = 0.90)
+    if (-not $Values -or $Values.Count -eq 0) { return [double]::NaN }
+    if ($Values.Count -eq 1) { return [double]$Values[0] }
+    $sorted = @($Values | Sort-Object)
+    $n = $sorted.Count
+    $r = ($n - 1) * $Percentile
+    $k = [int][math]::Floor($r)
+    $f = $r - $k
+    if ($k -ge ($n - 1)) { return [double]$sorted[$n - 1] }
+    return [double]($sorted[$k] + $f * ($sorted[$k + 1] - $sorted[$k]))
+}
+
 # Aggregate metrics
 $rows = foreach ($t in $testList) {
     $arr = $results[$t.Server].ToArray()
-    if ($arr.Count -gt 0) {
-        $min = [math]::Round(($arr | Measure-Object -Minimum).Minimum, 1)
-        $med = [math]::Round((Get-Median -Values $arr), 1)
-        $avg = [math]::Round(($arr | Measure-Object -Average).Average, 1)
-        $max = [math]::Round(($arr | Measure-Object -Maximum).Maximum, 1)
+    $cleanArr = @($arr | Where-Object { $_ -lt 1000 })
+    $spikes = $arr.Count - $cleanArr.Count
+    if ($cleanArr.Count -gt 0) {
+        $min = [math]::Round(($cleanArr | Measure-Object -Minimum).Minimum, 1)
+        $med = [math]::Round((Get-Median -Values $cleanArr), 1)
+        $avg = [math]::Round(($cleanArr | Measure-Object -Average).Average, 1)
+        $p90 = [math]::Round((Get-Percentile -Values $cleanArr -Percentile 0.90), 1)
+        $max = [math]::Round(($cleanArr | Measure-Object -Maximum).Maximum, 1)
         $dJitters = [System.Collections.Generic.List[double]]::new()
         foreach ($d in $Domains) {
             $dClean = @($rawSamples | Where-Object { $_.Server -eq $t.Server -and $_.Domain -eq $d -and ($_.Pass -is [int]) -and $_.Status -eq 'Success' -and $_.Elapsed_ms -lt 1000 } | ForEach-Object { [double]$_.Elapsed_ms })
@@ -336,7 +382,7 @@ $rows = foreach ($t in $testList) {
                 $dJitters.Add($dSum / ($dClean.Count - 1))
             }
         }
-        $jitter = if ($dJitters.Count -gt 0) { [math]::Round(($dJitters | Measure-Object -Average).Average, 1) } else { 0.0 }
+        $jitter = if ($dJitters.Count -gt 0) { [math]::Round(($dJitters | Measure-Object -Average).Average, 1) } else { -1 }
 
         $totalAttempts = $arr.Count + $fails[$t.Server]
         $lossPct = if ($totalAttempts -gt 0) { [math]::Round(($fails[$t.Server] / $totalAttempts) * 100, 1) } else { 0.0 }
@@ -345,11 +391,13 @@ $rows = foreach ($t in $testList) {
             Provider  = $t.Provider
             Server    = $t.Server
             Samples   = $arr.Count
+            Spikes    = $spikes
             Fail      = $fails[$t.Server]
             Loss_pct  = $lossPct
             Min_ms    = $min
             Med_ms    = $med
             Avg_ms    = $avg
+            P90_ms    = $p90
             Max_ms    = $max
             Jitter_ms = $jitter
         }
@@ -358,12 +406,14 @@ $rows = foreach ($t in $testList) {
         [pscustomobject]@{
             Provider  = $t.Provider
             Server    = $t.Server
-            Samples   = 0
+            Samples   = $arr.Count
+            Spikes    = $spikes
             Fail      = $fails[$t.Server]
-            Loss_pct  = if ($fails[$t.Server] -gt 0) { 100.0 } else { 0.0 }
+            Loss_pct  = if (($arr.Count + $fails[$t.Server]) -gt 0) { [math]::Round(($fails[$t.Server] / ($arr.Count + $fails[$t.Server])) * 100, 1) } else { 0.0 }
             Min_ms    = -1
             Med_ms    = -1
             Avg_ms    = -1
+            P90_ms    = -1
             Max_ms    = -1
             Jitter_ms = -1
         }
@@ -375,12 +425,13 @@ $eligible = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 } |
 $ineligible = @($rows | Where-Object { -not ($_.Loss_pct -le 10 -and $_.Med_ms -gt 0) } | Sort-Object Fail, @{ Expression = { if ($_.Med_ms -lt 0) { [double]::MaxValue } else { $_.Med_ms } } })
 Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
-($eligible + $ineligible) | Select-Object Provider, Server, Samples, Fail, Loss_pct,
-@{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0) { $_.Min_ms } else { '-' } } },
-@{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0) { $_.Med_ms } else { '-' } } },
-@{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0) { $_.Avg_ms } else { '-' } } },
-@{ Name = 'Max_ms'; Expression = { if ($_.Samples -gt 0) { $_.Max_ms } else { '-' } } },
-@{ Name = 'Jitter_ms'; Expression = { if ($_.Samples -gt 0) { $_.Jitter_ms } else { '-' } } } | Format-Table -AutoSize
+($eligible + $ineligible) | Select-Object Provider, Server, Samples, Spikes, Fail, Loss_pct,
+@{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Min_ms -ge 0) { $_.Min_ms } else { '-' } } },
+@{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Med_ms -ge 0) { $_.Med_ms } else { '-' } } },
+@{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Avg_ms -ge 0) { $_.Avg_ms } else { '-' } } },
+@{ Name = 'P90_ms'; Expression = { if ($_.Samples -gt 0 -and $_.P90_ms -ge 0) { $_.P90_ms } else { '-' } } },
+@{ Name = 'Max_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Max_ms -ge 0) { $_.Max_ms } else { '-' } } },
+@{ Name = 'Jitter_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Jitter_ms -ge 0) { $_.Jitter_ms } else { '-' } } } | Format-Table -AutoSize
 
 function Get-ServerBadge([pscustomobject]$s) {
     if ($s.Fail -eq 0) { return "[Zero-Loss]" }
@@ -388,6 +439,17 @@ function Get-ServerBadge([pscustomobject]$s) {
 }
 
 # Evaluate family pairs for smart recommendations (Stability vs. Speed)
+$securityTiers = @{
+    'Quad9'              = 1
+    'Cloudflare Malware' = 1
+    'AdGuard'            = 2
+    'Cloudflare Family'  = 2
+    'OpenDNS'            = 2
+    'Cloudflare'         = 3
+    'Google'             = 3
+    'Quad9 NoFilter'     = 3
+}
+
 $clean = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 })
 if ($clean.Count -ge 1) {
     $evaluatedPairs = [System.Collections.Generic.List[psobject]]::new()
@@ -407,15 +469,21 @@ if ($clean.Count -ge 1) {
                 $sec = if ($s.Med_ms -le $partner.Med_ms) { $partner } else { $s }
                 $pairMax = [math]::Max($pri.Max_ms, $sec.Max_ms)
                 $pairMed = [math]::Round(($pri.Med_ms + $sec.Med_ms) / 2, 1)
+                $pairP90 = [math]::Max($pri.P90_ms, $sec.P90_ms)
                 $pairJitter = [math]::Max($pri.Jitter_ms, $sec.Jitter_ms)
+                $pairSpikes = $pri.Spikes + $sec.Spikes
+                $tier = if ($securityTiers.ContainsKey($fam)) { $securityTiers[$fam] } else { 3 }
 
                 $evaluatedPairs.Add([pscustomobject]@{
-                        Family     = $fam
-                        Primary    = $pri
-                        Secondary  = $sec
-                        PairMax    = $pairMax
-                        PairMed    = $pairMed
-                        PairJitter = $pairJitter
+                        Family       = $fam
+                        Primary      = $pri
+                        Secondary    = $sec
+                        PairMax      = $pairMax
+                        PairMed      = $pairMed
+                        PairP90      = $pairP90
+                        PairJitter   = $pairJitter
+                        PairSpikes   = $pairSpikes
+                        SecurityTier = $tier
                     })
             }
         }
@@ -424,23 +492,28 @@ if ($clean.Count -ge 1) {
     Write-Host "=== RECOMMENDATIONS ===" -ForegroundColor Yellow
 
     if ($evaluatedPairs.Count -gt 0) {
-        $stablePair = $evaluatedPairs | Sort-Object PairMax, PairJitter | Select-Object -First 1
-        $fastestPair = $evaluatedPairs | Sort-Object PairMed | Select-Object -First 1
-        $freezeNote = if ($stablePair.PairMax -lt 1000) { "Zero multi-second freezes." } else { "Multi-second spikes were observed (Max {0} ms)." -f $stablePair.PairMax }
+        $minMed = ($evaluatedPairs | Measure-Object -Property PairMed -Minimum).Minimum
+        $deadBandPairs = @($evaluatedPairs | Where-Object { $_.PairMed -le ($minMed + 15.0) })
+        $recommendedPair = $deadBandPairs | Sort-Object SecurityTier, PairP90, PairMed | Select-Object -First 1
+        $fastestRawPair = $evaluatedPairs | Sort-Object PairMed | Select-Object -First 1
 
-        if ($stablePair.Family -eq $fastestPair.Family) {
-            Write-Host ("Recommended Pair (Fastest & Most Stable): Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor Green
-            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). {2}" -f $stablePair.PairMax, $stablePair.PairJitter, $freezeNote) -ForegroundColor DarkGray
+        $recFreezeNote = if ($recommendedPair.PairSpikes -eq 0) { "Zero retry spikes (>=1000 ms)." } else { "{0} retry spike(s) observed (Clean P90 {1} ms, Max {2} ms)." -f $recommendedPair.PairSpikes, $recommendedPair.PairP90, $recommendedPair.PairMax }
+        $recJitter = if ($recommendedPair.PairJitter -ge 0) { '{0} ms' -f $recommendedPair.PairJitter } else { '-' }
+
+        if ($recommendedPair.Family -eq $fastestRawPair.Family) {
+            Write-Host ("Recommended Pair (Fastest & Most Secure): Primary {0} {1} + Secondary {2} {3} ({4})" -f $recommendedPair.Primary.Server, (Get-ServerBadge $recommendedPair.Primary), $recommendedPair.Secondary.Server, (Get-ServerBadge $recommendedPair.Secondary), $recommendedPair.Family) -ForegroundColor Green
+            Write-Host ("   Profile: Consistent latency (Clean P90 {0} ms, Median {1} ms, Jitter {2}). {3}" -f $recommendedPair.PairP90, $recommendedPair.PairMed, $recJitter, $recFreezeNote) -ForegroundColor DarkGray
         }
         else {
-            Write-Host ("1. Most Stable Pair (Recommended for Coding, Work & Daily Use):" ) -ForegroundColor Green
-            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor White
-            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). {2}" -f $stablePair.PairMax, $stablePair.PairJitter, $freezeNote) -ForegroundColor DarkGray
+            Write-Host ("1. Recommended Pair (Balanced Security & Consistency):" ) -ForegroundColor Green
+            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $recommendedPair.Primary.Server, (Get-ServerBadge $recommendedPair.Primary), $recommendedPair.Secondary.Server, (Get-ServerBadge $recommendedPair.Secondary), $recommendedPair.Family) -ForegroundColor White
+            Write-Host ("   Profile: Consistent latency (Clean P90 {0} ms, Median {1} ms, Jitter {2}). {3}" -f $recommendedPair.PairP90, $recommendedPair.PairMed, $recJitter, $recFreezeNote) -ForegroundColor DarkGray
 
-            Write-Host ("`n2. Fastest Raw Median (Lower Base Ping, but Spiky):" ) -ForegroundColor Cyan
-            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $fastestPair.Primary.Server, (Get-ServerBadge $fastestPair.Primary), $fastestPair.Secondary.Server, (Get-ServerBadge $fastestPair.Secondary), $fastestPair.Family) -ForegroundColor White
-            $spikeNotice = if ($fastestPair.PairMax -gt 250) { " [Notice: Experienced spikes up to {0} ms]" -f $fastestPair.PairMax } else { "" }
-            Write-Host ("   Profile: Median {0} ms, Max {1} ms, Jitter {2} ms{3}" -f $fastestPair.PairMed, $fastestPair.PairMax, $fastestPair.PairJitter, $spikeNotice) -ForegroundColor DarkGray
+            $rawJitter = if ($fastestRawPair.PairJitter -ge 0) { '{0} ms' -f $fastestRawPair.PairJitter } else { '-' }
+            $spikeNotice = if ($fastestRawPair.PairSpikes -gt 0) { " [{0} spike(s) >=1000 ms]" -f $fastestRawPair.PairSpikes } else { "" }
+            Write-Host ("`n2. Fastest Raw Median (Lowest Latency, Unfiltered):" ) -ForegroundColor Cyan
+            Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $fastestRawPair.Primary.Server, (Get-ServerBadge $fastestRawPair.Primary), $fastestRawPair.Secondary.Server, (Get-ServerBadge $fastestRawPair.Secondary), $fastestRawPair.Family) -ForegroundColor White
+            Write-Host ("   Profile: Median {0} ms, Clean P90 {1} ms, Jitter {2}{3}" -f $fastestRawPair.PairMed, $fastestRawPair.PairP90, $rawJitter, $spikeNotice) -ForegroundColor DarkGray
         }
     }
     else {
@@ -460,7 +533,7 @@ if ($clean.Count -ge 1) {
 
     # Compare against active System DNS
     $sysServersInClean = @($clean | Where-Object { $systemDns.ContainsKey($_.Server) })
-    $chosenPrimary = if ($evaluatedPairs.Count -gt 0) { $stablePair.Primary } else { $primary }
+    $chosenPrimary = if ($evaluatedPairs.Count -gt 0) { $recommendedPair.Primary } else { $primary }
     if ($sysServersInClean.Count -gt 0 -and $chosenPrimary) {
         $bestSys = $sysServersInClean | Sort-Object Med_ms | Select-Object -First 1
         $diff = [math]::Round($bestSys.Med_ms - $chosenPrimary.Med_ms, 1)
@@ -481,7 +554,7 @@ if ($clean.Count -ge 1) {
     # Actionable PowerShell commands to apply / reset DNS
     if ($activeAdapter) {
         $recIps = if ($evaluatedPairs.Count -gt 0) {
-            "'{0}', '{1}'" -f $stablePair.Primary.Server, $stablePair.Secondary.Server
+            "'{0}', '{1}'" -f $recommendedPair.Primary.Server, $recommendedPair.Secondary.Server
         }
         elseif ($secondary) {
             "'{0}', '{1}'" -f $primary.Server, $secondary.Server
