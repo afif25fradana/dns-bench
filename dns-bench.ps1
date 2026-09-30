@@ -328,18 +328,18 @@ $rows = foreach ($t in $testList) {
         $med = [math]::Round((Get-Median -Values $arr), 1)
         $avg = [math]::Round(($arr | Measure-Object -Average).Average, 1)
         $max = [math]::Round(($arr | Measure-Object -Maximum).Maximum, 1)
-        $cleanArr = @($arr | Where-Object { $_ -lt 1000 })
-        $jitter = if ($cleanArr.Count -ge 2) {
-            $diffSum = 0
-            for ($i = 0; $i -lt ($cleanArr.Count - 1); $i++) {
-                $diffSum += [math]::Abs($cleanArr[$i + 1] - $cleanArr[$i])
+        $dJitters = [System.Collections.Generic.List[double]]::new()
+        foreach ($d in $Domains) {
+            $dClean = @($rawSamples | Where-Object { $_.Server -eq $t.Server -and $_.Domain -eq $d -and ($_.Pass -is [int]) -and $_.Status -eq 'Success' -and $_.Elapsed_ms -lt 1000 } | ForEach-Object { [double]$_.Elapsed_ms })
+            if ($dClean.Count -ge 2) {
+                $dSum = 0
+                for ($j = 0; $j -lt ($dClean.Count - 1); $j++) {
+                    $dSum += [math]::Abs($dClean[$j + 1] - $dClean[$j])
+                }
+                $dJitters.Add($dSum / ($dClean.Count - 1))
             }
-            [math]::Round($diffSum / ($cleanArr.Count - 1), 1)
-        } elseif ($cleanArr.Count -eq 1) {
-            0.0
-        } else {
-            [math]::Round($max - $min, 1)
         }
+        $jitter = if ($dJitters.Count -gt 0) { [math]::Round(($dJitters | Measure-Object -Average).Average, 1) } else { 0.0 }
 
         $totalAttempts = $arr.Count + $fails[$t.Server]
         $lossPct = if ($totalAttempts -gt 0) { [math]::Round(($fails[$t.Server] / $totalAttempts) * 100, 1) } else { 0.0 }
