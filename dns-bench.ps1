@@ -461,7 +461,8 @@ if ($clean.Count -ge 1) {
         } else {
             Write-Host ("1. Most Stable Pair (Recommended for Coding, Work & Daily Use):" ) -ForegroundColor Green
             Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $stablePair.Primary.Server, (Get-ServerBadge $stablePair.Primary), $stablePair.Secondary.Server, (Get-ServerBadge $stablePair.Secondary), $stablePair.Family) -ForegroundColor White
-            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). Zero multi-second freezes." -f $stablePair.PairMax, $stablePair.PairJitter) -ForegroundColor DarkGray
+            $freezeNote = if ($stablePair.PairMax -lt 1000) { "Zero multi-second freezes." } else { "Multi-second spikes were observed (Max {0} ms)." -f $stablePair.PairMax }
+            Write-Host ("   Profile: Consistent latency (Max {0} ms, Jitter {1} ms). {2}" -f $stablePair.PairMax, $stablePair.PairJitter, $freezeNote) -ForegroundColor DarkGray
 
             Write-Host ("`n2. Fastest Raw Median (Lower Base Ping, but Spiky):" ) -ForegroundColor Cyan
             Write-Host ("   Primary {0} {1} + Secondary {2} {3} ({4})" -f $fastestPair.Primary.Server, (Get-ServerBadge $fastestPair.Primary), $fastestPair.Secondary.Server, (Get-ServerBadge $fastestPair.Secondary), $fastestPair.Family) -ForegroundColor White
