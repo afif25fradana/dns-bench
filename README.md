@@ -84,4 +84,4 @@ Optional parameters:
 - **Loss Counting:** `Loss_pct` counts only queries that fail completely after the Windows DNS client has finished its own retries. A query whose first packet was lost but which succeeds on a resend is counted as a success.
 - **Latency Spikes from Retries:** Because of those retries, a `Max_ms` near 1, 3, or 7 seconds with 0% loss typically means a packet was resent (Windows waits about 1, 2, then 4 seconds between attempts). The script cannot see the resend directly; this is inferred from the timing pattern.
 - **Jitter Filtering:** `Jitter_ms` is computed only from successful samples under 1,000 ms, so very long spikes are shown in `Max_ms` but not in `Jitter_ms`.
-- **Recommendation Logic:** The "Most Stable" pick avoids servers with multi-second spikes while "Fastest Raw" may include them, as the console output labels it.
+- **Recommendation Logic:** "Most Stable" picks the pair with the lowest worst-case latency (`Max_ms`), while "Fastest Raw" picks the pair with the lowest median and may include spiky resolvers, as the console output labels it.
