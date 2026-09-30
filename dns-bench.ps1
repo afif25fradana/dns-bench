@@ -1,3 +1,31 @@
+<#
+.SYNOPSIS
+Lightweight DNS benchmark tool for Windows.
+
+.DESCRIPTION
+Measures latency, within-domain jitter, and packet loss across public DNS resolvers and active System DNS.
+
+.PARAMETER Passes
+Number of test passes per domain (default: 5). Aliased to 'Rounds'.
+
+.PARAMETER Servers
+Array of DNS server IP addresses to benchmark. If omitted, benchmarks default public resolvers and active System DNS.
+
+.PARAMETER ExcludeServers
+Array of DNS server IP addresses to exclude from benchmarking.
+
+.PARAMETER Domains
+Array of domain names to query during benchmark passes (default: www.google.com, www.cloudflare.com, www.wikipedia.org, www.microsoft.com).
+
+.EXAMPLE
+.\dns-bench.ps1
+
+.EXAMPLE
+.\dns-bench.ps1 -Passes 8
+
+.EXAMPLE
+.\dns-bench.ps1 -Servers '1.1.1.1','8.8.8.8' -Domains 'www.google.com','www.cloudflare.com'
+#>
 #Requires -Version 5.1
 
 param(
