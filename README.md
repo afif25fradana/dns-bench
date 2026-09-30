@@ -1,87 +1,110 @@
-# DNS Benchmark Script
+# DNS Benchmark
 
-A lightweight, non-invasive DNS benchmark script for Windows designed to test DNS resolvers under real-world connection conditions (such as high-jitter FWA, 4G/5G, or fiber links).
+A small PowerShell script that tells you which public DNS resolver is actually fastest from your connection — not from a data center on the other side of the planet.
 
-Runs via double-click wrapper (`dns-bench.bat`) or directly in PowerShell, compares public resolvers against your current active network connection, and exports a CSV report.
+It runs a warm-up pass to prime resolver caches, then tests each server in a round-robin rotation across 8 popular domains and gives you a ranked table with median latency, jitter, and packet loss. At the end it recommends the most stable pair and the raw fastest pair, compares them to whatever DNS you're currently using, and prints the exact command to switch.
 
----
-
-## What It Does
-
-- **Active System DNS Baseline:** Automatically detects and benchmarks DNS resolvers configured on currently connected network adapters (`Status = 'Up'`). Inactive or disconnected adapters (e.g. stale Wi-Fi or VPN profiles) are ignored.
-- **Interleaved Testing:** Queries servers round-robin using identical domains per pass, ensuring connection spikes or jitter affect all resolvers equally.
-- **Cache Warm-Up Discard:** Discards the warm-up pass to eliminate cold-cache penalties and startup latency.
-- **Comprehensive Metrics:** Measures and displays `Min`, `Median`, `Average`, `Max`, `Jitter` (spread), and failure count per resolver. Failed or unreachable servers sort cleanly to the bottom.
-- **Dual Smart Recommendations (Stability vs. Speed):**
-  - **Most Stable Pair:** Recommends the family pair with the lowest maximum latency and minimal jitter (best for coding, work, streaming, and daily browsing without lag spikes).
-  - **Fastest Raw Median:** Identifies the lowest base ping pair while flagging multi-second latency spikes if detected.
-- **Family-Aware Pairing:** Always pairs a primary resolver with its sibling secondary resolver from the same provider family, preventing filtering leaks during failovers.
-- **CSV Logging:** Automatically saves results with timestamps (`dns-bench-yyyyMMdd-HHmmss.csv`) for record keeping. Historical baseline runs can be archived in the `results/` folder for daytime vs. peak-hour comparisons.
-- **100% Safe & Read-Only:** Only sends standard DNS queries via native `Resolve-DnsName`. Does **not** modify adapter settings, flush cache, touch the registry, or require Administrator privileges.
+Works on Windows PowerShell 5.1+. No admin rights needed to run the benchmark.
 
 ---
 
-## Tested Resolvers
+## What it measures
 
-| Provider | Primary IP | Secondary IP | Notes |
+- **Min / Median / Average / Max latency** — in milliseconds, per resolver.
+- **Jitter** — mean absolute successive difference across clean (< 1000 ms) samples, computed per domain then averaged. Spikes from Windows DNS retry backoffs are excluded so one lost packet doesn't ruin the number.
+- **Packet loss %** — queries that timed out completely after Windows finished its own retries.
+
+Servers with > 10% loss sort to the bottom. `-1` in the CSV means no successful response was received for that server at all.
+
+A note on what the numbers actually mean: after the warm-up pass, the resolver's own cache answers repeat queries. So you're measuring **warm-cache RTT to the provider's anycast edge**, not cold recursive resolution speed. That's the number that matters for your actual browsing anyway.
+
+---
+
+## Resolvers tested by default
+
+| Provider | Primary | Secondary | Notes |
 | :--- | :--- | :--- | :--- |
-| **Current System** | *Auto-detected* | — | Active network DNS on connected adapter (`Status = 'Up'`) |
-| **Cloudflare** | `1.1.1.1` | `1.0.0.1` | Standard fast public resolver |
-| **Cloudflare Malware** | `1.1.1.2` | `1.0.0.2` | Blocks known malware |
+| **Your System DNS** | auto-detected | — | Whatever is configured on your active adapter |
+| **Cloudflare** | `1.1.1.1` | `1.0.0.1` | Fast public resolver |
+| **Cloudflare Malware** | `1.1.1.2` | `1.0.0.2` | Blocks known malware domains |
 | **Google** | `8.8.8.8` | `8.8.4.4` | Standard public resolver |
-| **Quad9** | `9.9.9.9` | `149.112.112.112` | Threat intelligence and malware blocking |
-| **OpenDNS** | `208.67.222.222` | `208.67.220.220` | Cisco Umbrella family |
-| **AdGuard** | `94.140.14.14` | `94.140.15.15` | Default ad and tracker blocking |
+| **Quad9** | `9.9.9.9` | `149.112.112.112` | Threat intelligence blocking |
+| **OpenDNS** | `208.67.222.222` | `208.67.220.220` | Cisco Umbrella |
+| **AdGuard** | `94.140.14.14` | `94.140.15.15` | Ad and tracker blocking |
 
 ---
 
-## How to Use
+## How to run
 
-### Method 1: Double-Click (Recommended)
-1. Double-click `dns-bench.bat`.
-2. Wait for the test passes to complete.
-3. Review the results table and recommendation in the command window.
+### Just double-click
 
-### Method 2: PowerShell CLI
-Run directly in PowerShell with default settings (5 passes = 20 scored queries per server plus 1 warm-up pass):
+Double-click `dns-bench.bat`. A window opens, runs the test, pauses so you can read the results, and closes when you press a key.
+
+### PowerShell
+
+```powershell
+.\dns-bench.ps1
+```
+
+Or via explicit policy bypass if your system blocks unsigned scripts:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\dns-bench.ps1
 ```
 
-Optional parameters:
+### Options
+
 ```powershell
-# Run with 8 passes
+# More passes = more data points, longer run
 .\dns-bench.ps1 -Passes 8
 
-# Exclude specific servers from testing
+# Quick check with 2 passes and 4 domains (~1 min)
+.\dns-bench.ps1 -Quick
+
+# Skip specific servers
 .\dns-bench.ps1 -ExcludeServers '1.1.1.1','1.0.0.1'
 
-# Benchmark specific servers only
+# Test specific servers only
 .\dns-bench.ps1 -Servers '9.9.9.9','149.112.112.112','208.67.222.222','208.67.220.220'
 
-# Benchmark custom domains
+# Test against different domains
 .\dns-bench.ps1 -Domains 'github.com','cloudflare.com','google.com'
 ```
 
----
-
-## Analysis Tips
-
-- **Median vs. Jitter:** Always check both **Med_ms** (typical speed) and **Jitter_ms** / **Max_ms** (consistency). A resolver with a 45 ms median but a 7,000 ms spike will feel much worse than a steady 60 ms resolver with a 75 ms max.
-- **Human Perception:** A difference under 15–20 ms is rarely noticeable during daily web browsing. Prioritize stability and security features over negligible median gains.
-- **Family Pairing:** If you use a security or ad-blocking resolver, ensure both primary and secondary DNS use the same provider to avoid security leaks during failovers.
+`-Rounds` is accepted as an alias for `-Passes`.
 
 ---
 
-## Known Limitations
+## Reading the results
 
-- **Warm-Cache Edge Latency:** Queries use popular domains primed by a warm-up pass, measuring network transit RTT to each provider's Anycast edge location rather than cold recursive resolution performance.
-- **IPv4 and A Records Only:** Benchmarks IPv4 DNS resolvers and queries `A` records only; IPv6 addresses and `AAAA` records are not tested.
-- **Loopback Resolvers (127.0.0.1):** Local caching daemons or proxies listening strictly on `127.0.0.1` are not auto-detected as System DNS.
-- **Adapter Scope:** System DNS detection inspects all connected network adapters (`Status = 'Up'`). If VPN connections or virtual adapters (e.g. WSL/Hyper-V) are active, their configured DNS addresses will appear as additional System rows.
-- **Unreachable Servers & Runtime:** When a target server is unreachable or offline, Windows DNS client retry backoff takes roughly 10 seconds per query against that server before timing out. To avoid long runs, use `-ExcludeServers` to omit dead or blocked servers.
-- **CSV Missing Data:** A value of `-1` in the exported CSV metrics indicates that no successful response was received for that server.
-- **Loss Counting:** `Loss_pct` counts only queries that fail completely after the Windows DNS client has finished its own retries. A query whose first packet was lost but which succeeds on a resend is counted as a success.
-- **Latency Spikes from Retries:** Because of those retries, a `Max_ms` near 1, 3, or 7 seconds with 0% loss typically means a packet was resent (Windows waits about 1, 2, then 4 seconds between attempts). The script cannot see the resend directly; this is inferred from the timing pattern.
-- **Jitter Filtering:** `Jitter_ms` is computed only from successful samples under 1,000 ms, so very long spikes are shown in `Max_ms` but not in `Jitter_ms`.
-- **Recommendation Logic:** "Most Stable" picks the pair with the lowest worst-case latency (`Max_ms`), while "Fastest Raw" picks the pair with the lowest median and may include spiky resolvers, as the console output labels it.
+The table is sorted by median latency. Servers that failed too many queries appear at the bottom.
+
+**Median vs. Max:** A resolver with a 45 ms median but a 7,000 ms spike will feel much worse than a steady 60 ms resolver capped at 75 ms. Always glance at `Max_ms` and `Jitter_ms`, not just `Med_ms`.
+
+**How much difference is noticeable:** Under 15–20 ms is rarely perceptible during normal browsing. If two resolvers are within that band, pick the one with better security features.
+
+**Family pairing:** Recommendations always pair a resolver with its sibling from the same provider. That keeps security filtering consistent during a failover — mixing Quad9 (threat blocking) with Google (unfiltered) as primary/secondary means some traffic bypasses the filter.
+
+---
+
+## Results files
+
+Every run saves two CSVs to the `results/` folder next to the script:
+
+- `dns-bench-YYYYMMDD-HHmmss.csv` — aggregate stats, one row per server.
+- `dns-bench-YYYYMMDD-HHmmss-samples.csv` — every individual query with timestamp, pass number, domain, server, and elapsed time. Useful for comparing daytime vs. peak-hour runs.
+
+A value of `-1` in the CSV means that server returned no successful responses.
+
+---
+
+## Caveats worth knowing
+
+**Spikes near 1 s, 3 s, or 7 s with 0% loss** usually mean a packet was dropped and Windows retransmitted it (it waits ~1 s, ~2 s, then ~4 s between attempts). The script can't see the retransmit directly, but the timing pattern is unmistakable. These delays are real and are what your browser would also experience.
+
+**IPv4 / A records only.** IPv6 resolvers and AAAA queries aren't tested.
+
+**VPN or virtual adapters active?** If Docker, Hyper-V, WSL, or an active VPN tunnel is up, its DNS addresses may appear as additional "System DNS" rows. That's expected — they're real resolvers your system could use.
+
+**127.0.0.1 (local caching proxies) are excluded.** If you run a local DNS cache like Unbound or dnscrypt-proxy, it listens on loopback and is filtered out intentionally.
+
+**Slow servers time out slowly.** When a server is unreachable, Windows takes roughly 10 seconds per query before giving up. Use `-ExcludeServers` to skip any server you know is blocked or down.
