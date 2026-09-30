@@ -10,9 +10,11 @@ Works on Windows PowerShell 5.1+. No admin rights needed to run the benchmark.
 
 ## What it measures
 
-- **Min / Median / Average / Max latency** — in milliseconds, per resolver.
-- **Jitter** — mean absolute successive difference across clean (< 1000 ms) samples, computed per domain then averaged. Spikes from Windows DNS retry backoffs are excluded so one lost packet doesn't ruin the number.
-- **Packet loss %** — queries that timed out completely after Windows finished its own retries.
+- **Min / Median / Average / Max latency** — in milliseconds, calculated on clean (< 1000 ms) samples so retry backoffs don't skew your baseline numbers.
+- **P90 latency** — 90th percentile clean latency (using NIST / R-7 linear interpolation), showing what 90% of your lookups feel like.
+- **Spikes** — queries that took >= 1000 ms due to packet loss and Windows DNS client retry backoffs.
+- **Jitter** — within-domain mean absolute successive difference across clean (< 1000 ms) samples, averaged across domains. Spikes are excluded so an occasional packet drop doesn't distort stability.
+- **Packet loss %** — queries that timed out completely after Windows exhausted its retry attempts.
 
 Servers with > 10% loss sort to the bottom. `-1` in the CSV means no successful response was received for that server at all.
 
@@ -78,9 +80,9 @@ powershell -ExecutionPolicy Bypass -File .\dns-bench.ps1
 
 The table is sorted by median latency. Servers that failed too many queries appear at the bottom.
 
-**Median vs. Max:** A resolver with a 45 ms median but a 7,000 ms spike will feel much worse than a steady 60 ms resolver capped at 75 ms. Always glance at `Max_ms` and `Jitter_ms`, not just `Med_ms`.
+**Median, P90, and Spikes:** A resolver with a 45 ms median but frequent multi-second spikes will feel much worse than a steady 60 ms resolver capped under 80 ms. Look at `P90_ms`, `Spikes`, and `Jitter_ms` alongside `Med_ms`.
 
-**How much difference is noticeable:** Under 15–20 ms is rarely perceptible during normal browsing. If two resolvers are within that band, pick the one with better security features.
+**Smart Recommendations & 15 ms Dead-Band:** Normal browsing rarely notices latency differences under 15–20 ms. When two providers are within 15 ms of each other, the script prioritizes security features (threat/malware filtering like Quad9 or Cloudflare Malware) over fractions of a millisecond in raw speed. If you prefer pure minimum ping regardless of filtering, the "Fastest Raw Median" option is always shown alongside it.
 
 **Family pairing:** Recommendations always pair a resolver with its sibling from the same provider. That keeps security filtering consistent during a failover — mixing Quad9 (threat blocking) with Google (unfiltered) as primary/secondary means some traffic bypasses the filter.
 
