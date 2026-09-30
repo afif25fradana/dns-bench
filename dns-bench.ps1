@@ -501,7 +501,7 @@ try {
     Write-Warning ("Failed to save raw samples CSV: {0}" -f $_.Exception.Message)
 }
 
-# Save aggregate CSV with run metadata
+# Save aggregate CSV summary report
 $csv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
 try {
     $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
