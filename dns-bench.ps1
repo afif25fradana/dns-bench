@@ -484,7 +484,7 @@ $allCleanTimes = @($results.Values | ForEach-Object { $_ } | Where-Object { $_ -
 $obsFloor = if ($allCleanTimes.Count -gt 0) { [math]::Round(($allCleanTimes | Measure-Object -Min).Minimum, 1) } else { 0 }
 
 Write-Host ""
-Write-Host ("Baseline Performance: Instrument Overhead ~0.55 ms (Win32 Cmdlet) | This Run's Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
+Write-Host ("Baseline Performance: Observed Network RTT Floor: {0} ms" -f $obsFloor) -ForegroundColor Cyan
 
 $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $outDir = Join-Path $baseDir 'results'
