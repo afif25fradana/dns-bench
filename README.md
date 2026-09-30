@@ -9,8 +9,8 @@ Runs via double-click wrapper (`dns-bench.bat`) or directly in PowerShell, compa
 ## What It Does
 
 - **Active System DNS Baseline:** Automatically detects and benchmarks DNS resolvers configured on currently connected network adapters (`Status = 'Up'`). Inactive or disconnected adapters (e.g. stale Wi-Fi or VPN profiles) are ignored.
-- **Interleaved Testing:** Queries servers round-robin using identical domains per round, ensuring connection spikes or jitter affect all resolvers equally.
-- **Cache Warm-Up Discard:** Discards the initial test round to eliminate cold-cache penalties and startup latency.
+- **Interleaved Testing:** Queries servers round-robin using identical domains per pass, ensuring connection spikes or jitter affect all resolvers equally.
+- **Cache Warm-Up Discard:** Discards the warm-up pass to eliminate cold-cache penalties and startup latency.
 - **Comprehensive Metrics:** Measures and displays `Min`, `Median`, `Average`, `Max`, `Jitter` (spread), and failure count per resolver. Failed or unreachable servers sort cleanly to the bottom.
 - **Dual Smart Recommendations (Stability vs. Speed):**
   - **Most Stable Pair:** Recommends the family pair with the lowest maximum latency and minimal jitter (best for coding, work, streaming, and daily browsing without lag spikes).
@@ -39,7 +39,7 @@ Runs via double-click wrapper (`dns-bench.bat`) or directly in PowerShell, compa
 
 ### Method 1: Double-Click (Recommended)
 1. Double-click `dns-bench.bat`.
-2. Wait for the test rounds to complete.
+2. Wait for the test passes to complete.
 3. Review the results table and recommendation in the command window.
 
 ### Method 2: PowerShell CLI
@@ -70,3 +70,14 @@ Optional parameters:
 - **Median vs. Jitter:** Always check both **Med_ms** (typical speed) and **Jitter_ms** / **Max_ms** (consistency). A resolver with a 45 ms median but a 7,000 ms spike will feel much worse than a steady 60 ms resolver with a 75 ms max.
 - **Human Perception:** A difference under 15–20 ms is rarely noticeable during daily web browsing. Prioritize stability and security features over negligible median gains.
 - **Family Pairing:** If you use a security or ad-blocking resolver, ensure both primary and secondary DNS use the same provider to avoid security leaks during failovers.
+
+---
+
+## Known Limitations
+
+- **Warm-Cache Edge Latency:** Queries use popular domains primed by a warm-up pass, measuring network transit RTT to each provider's Anycast edge location rather than cold recursive resolution performance.
+- **IPv4 and A Records Only:** Benchmarks IPv4 DNS resolvers and queries `A` records only; IPv6 addresses and `AAAA` records are not tested.
+- **Loopback Resolvers (127.0.0.1):** Local caching daemons or proxies listening strictly on `127.0.0.1` are not auto-detected as System DNS.
+- **Adapter Scope:** System DNS detection inspects all connected network adapters (`Status = 'Up'`). If VPN connections or virtual adapters (e.g. WSL/Hyper-V) are active, their configured DNS addresses will appear as additional System rows.
+- **Unreachable Servers & Runtime:** When a target server is unreachable or offline, Windows DNS client retry backoff takes roughly 10 seconds per query against that server before timing out. To avoid long runs, use `-ExcludeServers` to omit dead or blocked servers.
+- **CSV Missing Data:** A value of `-1` in the exported CSV metrics indicates that no successful response was received for that server.
