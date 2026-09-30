@@ -403,7 +403,12 @@ $rows = @($eligible + $ineligible)
 
 Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
-$rows | Format-Table -AutoSize
+$rows | Select-Object Provider, Server, Samples, Fail, Loss_pct,
+    @{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0) { $_.Min_ms } else { '-' } } },
+    @{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0) { $_.Med_ms } else { '-' } } },
+    @{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0) { $_.Avg_ms } else { '-' } } },
+    @{ Name = 'Max_ms'; Expression = { if ($_.Samples -gt 0) { $_.Max_ms } else { '-' } } },
+    @{ Name = 'Jitter_ms'; Expression = { if ($_.Samples -gt 0) { $_.Jitter_ms } else { '-' } } } | Format-Table -AutoSize
 
 function Get-ServerBadge([pscustomobject]$s) {
     if ($s.Fail -eq 0) { return "[Zero-Loss]" }
