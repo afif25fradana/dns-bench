@@ -1,2 +1,3 @@
 # Ignore temporary test run logs in root folder
 /dns-bench-*.csv
+results/
