@@ -81,3 +81,7 @@ Optional parameters:
 - **Adapter Scope:** System DNS detection inspects all connected network adapters (`Status = 'Up'`). If VPN connections or virtual adapters (e.g. WSL/Hyper-V) are active, their configured DNS addresses will appear as additional System rows.
 - **Unreachable Servers & Runtime:** When a target server is unreachable or offline, Windows DNS client retry backoff takes roughly 10 seconds per query against that server before timing out. To avoid long runs, use `-ExcludeServers` to omit dead or blocked servers.
 - **CSV Missing Data:** A value of `-1` in the exported CSV metrics indicates that no successful response was received for that server.
+- **Loss Counting:** `Loss_pct` counts only queries that fail completely after the Windows DNS client has finished its own retries. A query whose first packet was lost but which succeeds on a resend is counted as a success.
+- **Latency Spikes from Retries:** Because of those retries, a `Max_ms` near 1, 3, or 7 seconds with 0% loss typically means a packet was resent (Windows waits about 1, 2, then 4 seconds between attempts). The script cannot see the resend directly; this is inferred from the timing pattern.
+- **Jitter Filtering:** `Jitter_ms` is computed only from successful samples under 1,000 ms, so very long spikes are shown in `Max_ms` but not in `Jitter_ms`.
+- **Recommendation Logic:** The "Most Stable" pick avoids servers with multi-second spikes while "Fastest Raw" may include them, as the console output labels it.
