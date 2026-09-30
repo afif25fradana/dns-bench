@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 
 param(
+    [Alias('Rounds')]
     [ValidateRange(1, [int]::MaxValue)]
     [int]$Passes = 5,
-    [int]$Rounds = 0,
     [string[]]$Servers = @(),
     [string[]]$ExcludeServers = @(),
     [string[]]$Domains = @(
@@ -13,10 +13,6 @@ param(
         'www.microsoft.com'
     )
 )
-
-if ($Rounds -gt 0 -and $PSBoundParameters.ContainsKey('Rounds') -and -not $PSBoundParameters.ContainsKey('Passes')) {
-    $Passes = $Rounds
-}
 
 $ErrorActionPreference = 'SilentlyContinue'
 

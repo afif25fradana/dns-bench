@@ -43,15 +43,15 @@ Runs via double-click wrapper (`dns-bench.bat`) or directly in PowerShell, compa
 3. Review the results table and recommendation in the command window.
 
 ### Method 2: PowerShell CLI
-Run directly in PowerShell with default settings (8 rounds):
+Run directly in PowerShell with default settings (5 passes = 20 scored queries per server plus 1 warm-up pass):
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\dns-bench.ps1
 ```
 
 Optional parameters:
 ```powershell
-# Run with 12 rounds
-.\dns-bench.ps1 -Rounds 12
+# Run with 8 passes
+.\dns-bench.ps1 -Passes 8
 
 # Exclude specific servers from testing
 .\dns-bench.ps1 -ExcludeServers '1.1.1.1','1.0.0.1'
