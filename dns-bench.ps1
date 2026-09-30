@@ -56,15 +56,22 @@ $preflightDomain = if ($Domains.Count -gt 0) { $Domains[0] } else { 'www.google.
 Write-Host ("Checking internet connectivity ({0})..." -f $preflightDomain) -ForegroundColor Cyan
 $online = $false
 try {
-    $test = Resolve-DnsName -Name $preflightDomain -Type A -DnsOnly -NoHostsFile -ErrorAction Stop
-    if ($test) { $online = $true }
+    if (Resolve-DnsName -Name $preflightDomain -Type A -DnsOnly -NoHostsFile -ErrorAction Stop) { $online = $true }
 } catch {
-    $online = $false
+    foreach ($probe in @('1.1.1.1', '8.8.8.8')) {
+        try {
+            if (Resolve-DnsName -Name $preflightDomain -Server $probe -Type A -DnsOnly -NoHostsFile -ErrorAction Stop) {
+                Write-Warning ("System DNS failed for '{0}', but internet route is active via {1}. Continuing..." -f $preflightDomain, $probe)
+                $online = $true
+                break
+            }
+        } catch {}
+    }
 }
 
 if (-not $online) {
-    Write-Warning ("Could not resolve test domain '{0}'. Please verify your internet connection." -f $preflightDomain)
-    return
+    Write-Host ("Cannot resolve '{0}' via System DNS or public fallbacks (1.1.1.1, 8.8.8.8). Please verify your internet connection." -f $preflightDomain) -ForegroundColor Red
+    exit 1
 }
 
 # Detect active system DNS servers from connected adapters only (Status = 'Up')
