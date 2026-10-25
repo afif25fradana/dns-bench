@@ -6,7 +6,7 @@ Lightweight DNS benchmark tool for Windows.
 Measures latency, within-domain jitter, and packet loss across public DNS resolvers and active System DNS.
 
 .PARAMETER Passes
-Number of test passes per domain (default: 5). Aliased to 'Rounds'.
+Number of test passes per domain (default: 6). Aliased to 'Rounds'.
 
 .PARAMETER Quick
 Runs a fast benchmark with 2 passes and 4 domains (ideal for quick pre-work checks).
@@ -37,7 +37,7 @@ Array of domain names to query during benchmark passes (default: www.google.com,
 param(
     [ValidateRange(1, [int]::MaxValue)]
     [Alias('Rounds')]
-    [int]$Passes = 5,
+    [int]$Passes = 6,
     [switch]$Quick,
     [ValidateRange(0, 1000)]
     [int]$SleepMs = 25,
@@ -73,6 +73,19 @@ function Get-RotatedList($List, [int]$Offset) {
     @($List[$Offset..($List.Count - 1)]) + @($List[0..($Offset - 1)])
 }
 
+function Test-IsSinkholeIp([string]$IpStr) {
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($IpStr, [ref]$ip)) { return $false }
+    if ($ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $false }
+    $b = $ip.GetAddressBytes()
+    if ($b[0] -eq 0 -or $b[0] -eq 127 -or $b[0] -eq 10) { return $true }
+    if ($b[0] -eq 172 -and ($b[1] -ge 16 -and $b[1] -le 31)) { return $true }
+    if ($b[0] -eq 192 -and $b[1] -eq 168) { return $true }
+    if ($b[0] -eq 100 -and ($b[1] -ge 64 -and $b[1] -le 127)) { return $true }
+    if ($b[0] -eq 169 -and $b[1] -eq 254) { return $true }
+    return $false
+}
+
 function Invoke-DnsQuery {
     param(
         [pscustomobject]$Target,
@@ -92,23 +105,42 @@ function Invoke-DnsQuery {
         -SecondsRemaining $SecondsRemaining
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $ok = $true; $errId = ''
+    $ok = $true; $errId = ''; $isSinkhole = $false; $res = $null
     try {
-        $null = Resolve-DnsName -Name $Domain -Server $Target.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop
+        $res = Resolve-DnsName -Name $Domain -Server $Target.Server -Type A -DnsOnly -NoHostsFile -ErrorAction Stop
     }
     catch { $ok = $false; $errId = $_.FullyQualifiedErrorId }
     $sw.Stop()
 
+    if ($ok -and $res) {
+        foreach ($r in $res) {
+            if ($r.IPAddress -and (Test-IsSinkholeIp $r.IPAddress)) {
+                $isSinkhole = $true
+                $errId = 'SINKHOLE_DETECTED'
+                break
+            }
+        }
+    }
+
+    $opResult = if ($isSinkhole) { 'Sinkholed' } elseif ($ok) { '{0} ms' -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { 'Failed' }
     Write-Progress -Activity 'DNS Benchmark' `
         -Status $ProgressStatus `
-        -CurrentOperation ('{0} {1} ({2}) -> {3}' -f $verb, $Target.Provider, $Target.Server, $(if ($ok) { '{0} ms' -f [math]::Round($sw.Elapsed.TotalMilliseconds, 1) } else { 'Failed' })) `
+        -CurrentOperation ('{0} {1} ({2}) -> {3}' -f $verb, $Target.Provider, $Target.Server, $opResult) `
         -PercentComplete $Pct `
         -SecondsRemaining $SecondsRemaining
 
     if ($Score) {
-        if ($ok) { $script:results[$Target.Server].Add($sw.Elapsed.TotalMilliseconds) }
-        else { $script:fails[$Target.Server]++ }
+        if ($ok -and -not $isSinkhole) {
+            $script:results[$Target.Server].Add($sw.Elapsed.TotalMilliseconds)
+        }
+        elseif ($isSinkhole -or ($errId -like 'DNS_ERROR_RCODE_NAME_ERROR*')) {
+            $script:filtered[$Target.Server]++
+        }
+        else {
+            $script:fails[$Target.Server]++
+        }
     }
+    $sampleStatus = if ($isSinkhole) { 'Sinkhole' } elseif ($ok) { 'Success' } elseif ($errId -like 'DNS_ERROR_RCODE_NAME_ERROR*') { 'NXDOMAIN' } else { 'Fail' }
     $script:rawSamples.Add([pscustomobject]@{
         Timestamp  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
         Pass       = $PassLabel
@@ -116,8 +148,8 @@ function Invoke-DnsQuery {
         Domain     = $Domain
         Server     = $Target.Server
         Provider   = $Target.Provider
-        Elapsed_ms = if ($ok) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
-        Status     = if ($ok) { 'Success' } else { 'Fail' }
+        Elapsed_ms = if ($ok -and -not $isSinkhole) { [math]::Round($sw.Elapsed.TotalMilliseconds, 2) } else { -1 }
+        Status     = $sampleStatus
         ErrorId    = $errId
     })
     if ($SleepMs -gt 0) { Start-Sleep -Milliseconds $SleepMs }
@@ -149,7 +181,7 @@ $Domains = @(ConvertFrom-CsvParam $Domains)
 $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
 if ($upAdapters.Count -eq 0) {
     Write-Host "No active network adapters connected. Please verify your network connection." -ForegroundColor Red
-    exit 1
+    return
 }
 
 $preflightDomain = if ($Domains.Count -gt 0) { $Domains[0] } else { 'www.google.com' }
@@ -173,7 +205,7 @@ catch {
 
 if (-not $online) {
     Write-Host ("Cannot resolve '{0}' via System DNS or public fallbacks (1.1.1.1, 8.8.8.8). Please verify your internet connection." -f $preflightDomain) -ForegroundColor Red
-    exit 1
+    return
 }
 
 # Discover active default route (0.0.0.0/0) and connected adapters (Status = 'Up')
@@ -270,9 +302,11 @@ if ($testList.Count -eq 0) {
 # Benchmark execution with interleaved round-robin queries
 $results = @{}
 $fails = @{}
+$filtered = @{}
 foreach ($t in $testList) {
     $results[$t.Server] = [System.Collections.Generic.List[double]]::new()
     $fails[$t.Server] = 0
+    $filtered[$t.Server] = 0
 }
 
 $startTime = Get-Date
@@ -384,7 +418,7 @@ $rows = foreach ($t in $testList) {
         }
         $jitter = if ($dJitters.Count -gt 0) { [math]::Round(($dJitters | Measure-Object -Average).Average, 1) } else { -1 }
 
-        $totalAttempts = $arr.Count + $fails[$t.Server]
+        $totalAttempts = $arr.Count + $fails[$t.Server] + $filtered[$t.Server]
         $lossPct = if ($totalAttempts -gt 0) { [math]::Round(($fails[$t.Server] / $totalAttempts) * 100, 1) } else { 0.0 }
 
         [pscustomobject]@{
@@ -392,6 +426,7 @@ $rows = foreach ($t in $testList) {
             Server    = $t.Server
             Samples   = $arr.Count
             Spikes    = $spikes
+            Filtered  = $filtered[$t.Server]
             Fail      = $fails[$t.Server]
             Loss_pct  = $lossPct
             Min_ms    = $min
@@ -403,13 +438,17 @@ $rows = foreach ($t in $testList) {
         }
     }
     else {
+        $totalAttempts = $arr.Count + $fails[$t.Server] + $filtered[$t.Server]
+        $lossPct = if ($totalAttempts -gt 0) { [math]::Round(($fails[$t.Server] / $totalAttempts) * 100, 1) } else { 0.0 }
+
         [pscustomobject]@{
             Provider  = $t.Provider
             Server    = $t.Server
             Samples   = $arr.Count
             Spikes    = $spikes
+            Filtered  = $filtered[$t.Server]
             Fail      = $fails[$t.Server]
-            Loss_pct  = if (($arr.Count + $fails[$t.Server]) -gt 0) { [math]::Round(($fails[$t.Server] / ($arr.Count + $fails[$t.Server])) * 100, 1) } else { 0.0 }
+            Loss_pct  = $lossPct
             Min_ms    = -1
             Med_ms    = -1
             Avg_ms    = -1
@@ -425,7 +464,7 @@ $eligible = @($rows | Where-Object { $_.Loss_pct -le 10 -and $_.Med_ms -gt 0 } |
 $ineligible = @($rows | Where-Object { -not ($_.Loss_pct -le 10 -and $_.Med_ms -gt 0) } | Sort-Object Fail, @{ Expression = { if ($_.Med_ms -lt 0) { [double]::MaxValue } else { $_.Med_ms } } })
 Write-Host ""
 Write-Host "=== RESULTS (Sorted by Median Latency) ===" -ForegroundColor Green
-($eligible + $ineligible) | Select-Object Provider, Server, Samples, Spikes, Fail, Loss_pct,
+($eligible + $ineligible) | Select-Object Provider, Server, Samples, Spikes, Filtered, Fail, Loss_pct,
 @{ Name = 'Min_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Min_ms -ge 0) { $_.Min_ms } else { '-' } } },
 @{ Name = 'Med_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Med_ms -ge 0) { $_.Med_ms } else { '-' } } },
 @{ Name = 'Avg_ms'; Expression = { if ($_.Samples -gt 0 -and $_.Avg_ms -ge 0) { $_.Avg_ms } else { '-' } } },
@@ -596,7 +635,15 @@ catch {
 # Save aggregate CSV with run metadata
 $csv = Join-Path $outDir ("dns-bench-{0:yyyyMMdd-HHmmss}.csv" -f $startTime)
 try {
-    $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    $totalDurationSec = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)
+    $exportRows = $rows | Select-Object Provider, Server, Samples, Spikes, Filtered, Fail, Loss_pct, Min_ms, Med_ms, Avg_ms, P90_ms, Max_ms, Jitter_ms,
+        @{ Name = 'Adapter'; Expression = { $activeAdapter } },
+        @{ Name = 'Passes'; Expression = { $Passes } },
+        @{ Name = 'DomainCount'; Expression = { $Domains.Count } },
+        @{ Name = 'ObservedFloor_ms'; Expression = { $obsFloor } },
+        @{ Name = 'TotalDuration_s'; Expression = { $totalDurationSec } }
+
+    $exportRows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
     Write-Host ("Aggregate CSV report saved: {0}" -f $csv)
 }
 catch {
