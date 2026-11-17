@@ -27,7 +27,7 @@ Works on Windows PowerShell 5.1 and PowerShell 7+. No administrative privileges 
 | **Fail** | Queries that timed out completely after Windows exhausted its retry attempts (`ERROR_TIMEOUT`). |
 | **Loss_pct** | Genuine transport loss rate: $\frac{\text{Fail}}{\text{Samples} + \text{Fail} + \text{Filtered}} \times 100$. Filtered queries remain in the denominator as valid attempts, but do not count as lost packets. |
 | **Min / Med / Avg / Max** | Clean latency in milliseconds, calculated strictly on samples $< 1000\text{ ms}$. |
-| **P90_ms** | 90th percentile clean latency computed via NIST / R-7 linear interpolation, showing the latency ceiling for 90% of your queries. |
+| **P90_ms** | 90th percentile clean latency calculated using Hyndman & Fan Type 7 linear interpolation (the standard sample quantile default in R and NumPy), isolating baseline performance from transient UDP drops. |
 | **Jitter_ms** | Within-domain mean absolute successive difference (MASD) across clean samples, averaged across domains. Spikes are excluded so packet drops do not warp consistency metrics. Displays `-` when insufficient clean pairs exist. |
 
 Servers with $> 10\%$ packet loss sort to the bottom. In CSV reports, `-1` indicates that no successful response was received.
@@ -127,3 +127,9 @@ Records every individual query across warm-up and scored passes with `Timestamp`
 - **Local Caching Proxies:** Addresses in `127.0.0.0/8` are filtered out of active adapter discovery, as benchmarking a local cache daemon (like Unbound or Acrylic) does not measure upstream WAN transit.
 - **Unreachable Resolvers:** Windows takes ~10 seconds to fully time out an unreachable resolver across all retry stages. If an ISP blocks specific public DNS addresses, use `-ExcludeServers` to skip them and prevent benchmark stalls.
 - **Terminal Session Safety:** Pre-flight checks use `return` instead of `exit 1` so that launching the script in an active PowerShell window or VS Code terminal will not close the shell if a network check fails.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
